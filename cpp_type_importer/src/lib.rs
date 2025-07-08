@@ -4,7 +4,10 @@ use binaryninja::command::{register_command, Command};
 use binaryninja::high_level_il::operation::DerefFieldSsa;
 // use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
-use binaryninja::types::{FunctionParameter, MemberAccess, MemberScope, StructureBuilder, Type};
+use binaryninja::types::{
+    FunctionParameter, MemberAccess, MemberScope, NamedTypeReference, NamedTypeReferenceClass,
+    StructureBuilder, Type,
+};
 use binaryninja::update::time_since_last_update_check;
 use binaryninja::{architecture::Architecture, binary_view::BinaryView};
 use log::{error, info, LevelFilter};
@@ -167,7 +170,18 @@ impl Member {
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
-            panic!("asdf");
+            // Try to find an existing type ID
+            if let Some(type_id) = bv.type_id_by_name(t) {
+                let named_ref = NamedTypeReference::new_with_id(
+                    NamedTypeReferenceClass::StructNamedTypeClass,
+                    type_id,
+                    t,
+                );
+                println!("Found named type {:?}", named_ref);
+                Type::named_type(&named_ref)
+            } else {
+                panic!("Could not find type: {}", t);
+            }
         };
         for _ in 0..depth {
             typ = Type::pointer(
@@ -219,7 +233,14 @@ impl Member {
                     args: defined_args,
                 };
             } else {
-                panic!("Could not parse member definition: {}", def);
+                let (typ, name, depth) =
+                    parse_member_definition(def).expect(&format!("Could not parse {def}"));
+                let typ = Self::define_type(&typ, depth, bv);
+                return Member::Basic {
+                    name,
+                    typ,
+                    comments: vec![],
+                };
             }
         }
     }

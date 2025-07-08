@@ -10,6 +10,10 @@ struct ddd {
   void* (*f)(void*, int32_t);
 };
 
+struct ccc {
+  Zyx_abc* a;
+};
+
 template <typename T, typename UV> struct Abc {
   T* a;
   UV* *b;
