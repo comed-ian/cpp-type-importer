@@ -89,6 +89,7 @@ dependencies = [
  "binaryninja",
  "binaryninjacore-sys",
  "log",
+ "regex",
 ]
 
 [[package]]

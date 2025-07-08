@@ -4,10 +4,11 @@ use binaryninja::command::{register_command, Command};
 use binaryninja::high_level_il::operation::DerefFieldSsa;
 // use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
-use binaryninja::types::{MemberAccess, MemberScope, StructureBuilder, Type};
+use binaryninja::types::{FunctionParameter, MemberAccess, MemberScope, StructureBuilder, Type};
 use binaryninja::update::time_since_last_update_check;
 use binaryninja::{architecture::Architecture, binary_view::BinaryView};
 use log::{error, info, LevelFilter};
+use regex::Regex;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -89,18 +90,42 @@ impl<'a> Structure {
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
         let mut builder = StructureBuilder::new();
         for m in self.members.iter_mut() {
-            if let Member::Basic {
-                name,
-                typ,
-                comments,
-            } = m
-            {
-                builder.append(
-                    typ.as_ref(),
-                    name.clone(),
-                    MemberAccess::PublicAccess,
-                    MemberScope::NoScope,
-                );
+            match m {
+                Member::Basic {
+                    name,
+                    typ,
+                    comments,
+                } => {
+                    builder.append(
+                        typ.as_ref(),
+                        name.clone(),
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+                Member::Function { name, ret, args } => {
+                    println!("NAME: {name}");
+                    let mut v = vec![];
+                    for (arg_name, arg_type) in args {
+                        v.push(FunctionParameter::new(
+                            arg_type.clone(),
+                            arg_name.clone(),
+                            None,
+                        ));
+                    }
+                    let func = Type::function(ret.as_ref(), v, false);
+                    let func = Type::pointer(
+                        &bv.default_arch().expect("Could not find default arch"),
+                        func.as_ref(),
+                    );
+                    builder.append(
+                        func.as_ref(),
+                        name.clone(),
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+                _ => (),
             }
         }
         let s = Type::structure(&builder.finalize());
@@ -124,7 +149,11 @@ pub enum Member {
         typ: Ref<Type>,
         comments: Vec<String>,
     },
-    Function {},
+    Function {
+        name: String,
+        ret: Ref<Type>,
+        args: Vec<(String, Ref<Type>)>,
+    },
     Template {
         name: String,
         args: Vec<String>,
@@ -133,24 +162,65 @@ pub enum Member {
 }
 
 impl Member {
+    fn define_type(t: &str, depth: u8, bv: &BinaryView) -> Ref<Type> {
+        println!("Defining type {t}");
+        let mut typ = if let Some(tt) = is_primitive(t) {
+            tt
+        } else {
+            panic!("asdf");
+        };
+        for _ in 0..depth {
+            typ = Type::pointer(
+                &bv.default_arch().expect("Could not find core arch"),
+                typ.as_ref(),
+            );
+        }
+        typ
+    }
     fn new(def: &str, bv: &BinaryView) -> Self {
         let (typ, name, depth) =
             parse_member_definition(def).expect("Could not parse member definition");
         dbg!(format!("GOT MEMBER DEFINITION {typ} {name} {depth}"));
-        if let Some(mut t) = is_primitive(&typ) {
-            for _ in 0..depth {
-                t = Type::pointer(
-                    &bv.default_arch().expect("Could not find core arch"),
-                    t.as_ref(),
-                );
-            }
+        if let Some(_) = is_primitive(&typ) {
+            let typ = Self::define_type(&typ, depth, bv);
             return Member::Basic {
                 name,
-                typ: t,
+                typ,
                 comments: vec![],
             };
         } else {
-            panic!("AHH");
+            // Try to match function definition: return_type (*name)(args)
+            let func_regex = Regex::new(r"(.*) \(\*(.*)\)\((.*)\)").unwrap();
+            if let Some(captures) = func_regex.captures(def) {
+                let return_type = captures.get(1).unwrap().as_str().trim();
+                let name = captures.get(2).unwrap().as_str().trim();
+                let args = captures.get(3).unwrap().as_str().trim();
+
+                dbg!(format!(
+                    "GOT FUNCTION DEFINITION: return_type={}, name={}, args={:#}",
+                    return_type, name, args
+                ));
+                let (return_type, _, depth) = parse_member_definition(return_type)
+                    .expect("Could not parse function member return type");
+                println!("{return_type} {depth}");
+                let args = parse_template_instantiation(args)
+                    .expect("Could not parse function member args");
+                let mut defined_args = vec![];
+                println!("args={:?}", args);
+                for a in args {
+                    let (typ, name, depth) = parse_member_definition(&a)
+                        .expect("Could not parse argument to function definition");
+                    defined_args.push((name, Self::define_type(&typ, depth, bv)));
+                }
+
+                return Member::Function {
+                    name: name.to_string(),
+                    ret: Self::define_type(&return_type, depth, bv),
+                    args: defined_args,
+                };
+            } else {
+                panic!("Could not parse member definition: {}", def);
+            }
         }
     }
 }
@@ -278,7 +348,7 @@ fn parse_member_definition(def: &str) -> Option<(String, String, u8)> {
         def = trimmed;
     }
     let mut def = def.trim();
-    let name = parse_member_name(def)?;
+    let name = parse_member_name(def).unwrap_or("".to_string());
     def = def.strip_suffix(&name).unwrap();
     let (depth, suffix) = get_pointer_depth(def);
     if !suffix.is_empty() {

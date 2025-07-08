@@ -7,7 +7,7 @@ struct Zyx_abc {
 };
 
 struct ddd {
-  void (*f)(Zyx_abc*, int32_t);
+  void* (*f)(void*, int32_t);
 };
 
 template <typename T, typename UV> struct Abc {
