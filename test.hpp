@@ -36,3 +36,15 @@ template <typename T> struct eee {
 };
 
 eee<Zyx_abc>;
+
+enum fff : uint8_t {
+  ZERO,
+  ONE,
+  TWO
+};
+
+enum ggg {
+  GGGZERO=1,
+  GGGONE,
+  GGGTWO
+};

@@ -5,8 +5,8 @@ use binaryninja::high_level_il::operation::DerefFieldSsa;
 // use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
 use binaryninja::types::{
-    FunctionParameter, MemberAccess, MemberScope, NamedTypeReference, NamedTypeReferenceClass,
-    StructureBuilder, Type,
+    Enumeration, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
+    NamedTypeReference, NamedTypeReferenceClass, StructureBuilder, Type,
 };
 use binaryninja::update::time_since_last_update_check;
 use binaryninja::{architecture::Architecture, binary_view::BinaryView};
@@ -41,6 +41,80 @@ pub struct Template {
     name: String,
     typenames: Vec<String>,
     body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Enum {
+    name: String,
+    size: u64,
+    values: Vec<(String, u64)>,
+}
+
+impl<'a> Enum {
+    pub fn new(name: &str, size: u64, body: &str) -> Self {
+        let mut values = Vec::new();
+        let mut current_value = 0u64;
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let line = line.trim_end_matches(',');
+
+            if let Some(eq_pos) = line.find('=') {
+                // Parse explicit assignment like "GGGZERO=1"
+                let name = line[..eq_pos].trim().to_string();
+                let value_str = line[eq_pos + 1..].trim();
+
+                // Parse the numeric value
+                if let Ok(assigned_value) = value_str.parse::<u64>() {
+                    current_value = assigned_value;
+                } else {
+                    // If we can't parse it, default to current_value
+                    dbg!(format!(
+                        "Warning: Could not parse enum value '{value_str}', using {current_value}"
+                    ));
+                }
+
+                values.push((name, current_value));
+            } else {
+                // No explicit assignment, use current_value
+                values.push((line.to_string(), current_value));
+            }
+
+            current_value += 1;
+        }
+
+        Self {
+            name: name.to_string(),
+            size,
+            values,
+        }
+    }
+
+    pub fn define(&self, bv: &BinaryView) -> bool {
+        // Create an enumeration builder
+        let mut builder = EnumerationBuilder::new();
+
+        // Add each enum value to the builder with its correct numeric value
+        for (name, value) in &self.values {
+            builder.insert(name, *value);
+        }
+
+        // Finalize the enumeration
+        let enumeration = builder.finalize();
+
+        // Create the enum type with the specified width
+        let width = std::num::NonZeroUsize::new(self.size as usize)
+            .unwrap_or_else(|| std::num::NonZeroUsize::new(4).unwrap());
+        let enum_type = Type::enumeration(&enumeration, width, false);
+
+        // Define the type in Binary Ninja
+        bv.define_user_type(&self.name, &enum_type);
+        true
+    }
 }
 
 impl<'a> Template {
@@ -406,7 +480,7 @@ fn parse_name(def: &str) -> Option<String> {
     } else if s.starts_with("class ") {
         s = s.strip_prefix("class ")?;
     } else if s.starts_with("enum ") {
-        s.strip_prefix("enum ")?;
+        s = s.strip_prefix("enum ")?;
     }
     Some(s.to_string())
 }
@@ -457,59 +531,6 @@ fn parse_member_name(s: &str) -> Option<String> {
     }
     None
 }
-
-// impl Member {
-//     fn find_name(def: &str) -> (String, &str) {
-//         for (i, c) in def.chars().rev().enumerate() {
-//             match c {
-//                 '*' | ' ' => {
-//                     return (def[def.len() - i..].to_string(), &def[..def.len() - i]);
-//                 }
-//                 _ => continue,
-//             }
-//         }
-//         (String::new(), &def[..])
-//     }
-//     fn find_pointer_depth(def: &str) -> (u8, &str) {
-//         let mut depth = 0u8;
-//         for (i, c) in def.chars().rev().enumerate() {
-//             match c {
-//                 '*' => depth += 1,
-//                 ' ' => continue,
-//                 _ => return (depth, &def[..def.len() - i]),
-//             }
-//         }
-//         return (depth, &def[..]);
-//     }
-//     fn parse_basic(def: &str) -> Self {
-//         let (name, rest) = Member::find_name(def);
-//         // TODO get array from name
-//         let (depth, rest) = Member::find_pointer_depth(rest);
-//         println!("member name: {name}\nType: {}\nDepth: {depth}", rest.trim());
-//         let mut t: Ref<Type> = is_primitive(rest).unwrap_or(Type::void());
-//         // for _ in 0..depth {
-//         //     t = Type::pointer(Architecture::get("armv7").expect(), t.as_ref());
-//         // }
-//         Self::Basic {
-//             name: name.to_string(),
-//             comments: vec![],
-//             typ: t,
-//         }
-//     }
-//     pub fn parse(def: &str, templated_types: Vec<String>) -> Self {
-//         loop {
-//             let (i, c, s) = find_next_token(def).expect("Could not find token in Member::parse");
-//             match c {
-//                 // Simple definition
-//                 ';' => {
-//                     return Member::parse_basic(s.trim());
-//                 }
-//                 '<' => {}
-//                 _ => panic!("Unexpected starting token {c} in Member definition"),
-//             }
-//         }
-//     }
-// }
 
 fn find_next_token(s: &str) -> Option<(usize, char, &str)> {
     for (i, c) in s.char_indices() {
@@ -663,6 +684,44 @@ impl<'a> Parser<'a> {
                             s2 = s2.trim();
                             dbg!(format!("Got class {s2}"));
                             idx += i2 + 1;
+                        } else if s.starts_with("enum") {
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                                .expect("Could not find closing token");
+                            s2 = s2.trim();
+
+                            // Parse enum definition with optional size
+                            let enum_with_size_regex =
+                                Regex::new(r"enum\s+(\w+)\s*:\s*(\w+)").unwrap();
+                            let enum_no_size_regex = Regex::new(r"enum\s+(\w+)").unwrap();
+
+                            let (enum_name, size) =
+                                if let Some(captures) = enum_with_size_regex.captures(s) {
+                                    let enum_name = captures.get(1).unwrap().as_str();
+                                    let size_str = captures.get(2).unwrap().as_str();
+
+                                    let size = match size_str {
+                                        "uint8_t" | "char" => 1,
+                                        "uint16_t" | "short" => 2,
+                                        "uint32_t" | "int" => 4,
+                                        "uint64_t" | "long" => 8,
+                                        _ => 4, // default to 4 bytes
+                                    };
+
+                                    (enum_name, size)
+                                } else if let Some(captures) = enum_no_size_regex.captures(s) {
+                                    let enum_name = captures.get(1).unwrap().as_str();
+                                    (enum_name, 4) // default to uint32_t (4 bytes)
+                                } else {
+                                    panic!("Could not parse enum definition: {s}");
+                                };
+
+                            dbg!(format!("Got enum {enum_name} with size {size}"));
+                            let enum_def = Enum::new(enum_name, size, s2);
+                            enum_def.define(self.bv);
+
+                            idx += i2 + 1;
+                        } else {
+                            panic!("Could not handle definition: {s}");
                         }
                     }
                     _ => (),
