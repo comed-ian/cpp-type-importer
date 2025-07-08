@@ -97,4 +97,6 @@ class MMM : HHH, III, LLL {
   uint32_t getVal();
   // ; end vtable
   uint32_t MMM_val;
+  bool arg2; // ; override bool III::arg1;
+  void** (*cb2)(); // ; override void* (* HHH::cb)();
 };

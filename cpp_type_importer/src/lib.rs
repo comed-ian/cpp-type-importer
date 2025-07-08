@@ -233,8 +233,8 @@ impl<'a> Structure {
 pub struct Class {
     name: String,
     vtable_methods: Vec<(Member, Option<String>)>, // Store method and override info
-    member_variables: Vec<Member>,
-    base_classes: Vec<String>, // Store base class names for now
+    member_variables: Vec<(Member, Option<String>)>, // Store member and override info
+    base_classes: Vec<String>,                     // Store base class names for now
 }
 
 impl<'a> Class {
@@ -290,8 +290,17 @@ impl<'a> Class {
                 }
             } else {
                 // Parse member variable
-                let member = Member::new(line, bv, None, None);
-                member_variables.push(member);
+                let override_regex = Regex::new(r"//\s*;\s*override\s+(.+?);").unwrap();
+                let override_info = if let Some(captures) = override_regex.captures(line) {
+                    Some(captures.get(1).unwrap().as_str().to_string())
+                } else {
+                    None
+                };
+
+                // Remove override comment from the line
+                let clean_line = override_regex.replace(line, "").trim().to_string();
+                let member = Member::new(&clean_line, bv, None, None);
+                member_variables.push((member, override_info));
             }
         }
 
@@ -569,6 +578,55 @@ impl<'a> Class {
         Some(cleaned.to_string())
     }
 
+    fn extract_member_from_override(override_str: &str, base_class: &str) -> Option<String> {
+        // For member overrides, remove the base_class:: prefix from anywhere in the string
+        let prefix = format!("{}::", base_class);
+        let cleaned = override_str.replace(&prefix, "");
+        Some(cleaned)
+    }
+
+    fn parse_member_override_offset(
+        override_str: &str,
+        base_classes: &[String],
+        bv: &'a BinaryView,
+    ) -> Option<(String, u64)> {
+        // Try to find the member in each base class
+        for base_class in base_classes {
+            if let Some(cleaned_override) =
+                Self::extract_member_from_override(override_str, base_class)
+            {
+                if let Some(base_type_id) = bv.type_id_by_name(base_class) {
+                    if let Some(base_type) = bv.type_by_id(&base_type_id) {
+                        if let Some(structure) = base_type.get_structure() {
+                            // Find the member in the base class structure
+                            for member in structure.members() {
+                                let mut member_type_contents = member.ty.contents.to_string();
+                                let check_against =
+                                    if let Some(star_pos) = member_type_contents.find("(*)") {
+                                        member_type_contents
+                                            .insert_str(star_pos + 2, &format!(" {}", member.name));
+                                        member_type_contents
+                                    } else {
+                                        format!("{member_type_contents} {}", member.name)
+                                    };
+
+                                println!(
+                                    "Checking member override '{}' against base class '{}' member '{}' with type '{}'",
+                                    cleaned_override, base_class, member.name, check_against
+                                );
+
+                                if cleaned_override == check_against {
+                                    return Some((base_class.clone(), member.offset));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn define(&self, bv: &'a BinaryView) -> bool {
         // Create vtables for each base class
         let mut vtable_names = Vec::new();
@@ -741,8 +799,74 @@ impl<'a> Class {
             }
         }
 
-        // Step 3: Add member variables specific to this class
-        for member in &self.member_variables {
+        // Step 3: Handle member variable overrides and add member variables specific to this class
+        let mut cumulative_base_offset = 0u64;
+        for (member, override_info) in &self.member_variables {
+            if let Some(override_str) = override_info {
+                // This member overrides a base class member
+                if let Some((base_class, base_offset)) =
+                    Self::parse_member_override_offset(override_str, &self.base_classes, bv)
+                {
+                    // Calculate the actual offset by adding the base class offset
+                    let mut actual_offset = base_offset;
+                    for (i, base) in self.base_classes.iter().enumerate() {
+                        if base == &base_class {
+                            break;
+                        }
+                        // Add the size of previous base classes
+                        if let Some(prev_base_type_id) = bv.type_id_by_name(base) {
+                            if let Some(prev_base_type) = bv.type_by_id(&prev_base_type_id) {
+                                actual_offset += prev_base_type.width();
+                            }
+                        }
+                    }
+
+                    // Insert the overriding member at the calculated offset
+                    match member {
+                        Member::Basic {
+                            name,
+                            typ,
+                            comments: _,
+                        } => {
+                            class_builder.insert(
+                                typ.as_ref(),
+                                name,
+                                actual_offset,
+                                true, // overwrite existing
+                                MemberAccess::PublicAccess,
+                                MemberScope::NoScope,
+                            );
+                        }
+                        Member::Function { name, ret, args } => {
+                            let mut params = vec![];
+                            for (arg_name, arg_type) in args {
+                                params.push(FunctionParameter::new(
+                                    arg_type.clone(),
+                                    arg_name.clone(),
+                                    None,
+                                ));
+                            }
+                            let func = Type::function(ret.as_ref(), params, false);
+                            let func_ptr = Type::pointer(
+                                &bv.default_arch().expect("Could not find default arch"),
+                                func.as_ref(),
+                            );
+                            class_builder.insert(
+                                func_ptr.as_ref(),
+                                name,
+                                actual_offset,
+                                true, // overwrite existing
+                                MemberAccess::PublicAccess,
+                                MemberScope::NoScope,
+                            );
+                        }
+                        _ => (),
+                    }
+                    continue;
+                }
+            }
+
+            // No override, append normally
             match member {
                 Member::Basic {
                     name,
