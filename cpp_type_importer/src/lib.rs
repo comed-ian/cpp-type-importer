@@ -5,7 +5,7 @@ use binaryninja::high_level_il::operation::DerefFieldSsa;
 // use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
 use binaryninja::types::{
-    Enumeration, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
+    BaseStructure, Enumeration, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
     NamedTypeReference, NamedTypeReferenceClass, StructureBuilder, Type,
 };
 use binaryninja::update::time_since_last_update_check;
@@ -433,60 +433,196 @@ impl<'a> Class {
     }
 
     pub fn define(&self, bv: &'a BinaryView) -> bool {
-        // First, create and define the vtable structure
-        let vtable_name = format!("{}_vtable", self.name);
-        let mut vtable_builder = StructureBuilder::new();
+        // Create vtables for each base class
+        let mut vtable_names = Vec::new();
 
-        for method in &self.vtable_methods {
-            if let Member::Function { name, ret, args } = method {
-                // Create function pointer type for vtable entry
-                let mut params = vec![];
-                for (arg_name, arg_type) in args {
-                    params.push(FunctionParameter::new(
-                        arg_type.clone(),
-                        arg_name.clone(),
-                        None,
-                    ));
+        if self.base_classes.is_empty() {
+            // No inheritance - create regular vtable
+            let vtable_name = format!("{}_vtable", self.name);
+            let mut vtable_builder = StructureBuilder::new();
+
+            for method in &self.vtable_methods {
+                if let Member::Function { name, ret, args } = method {
+                    let mut params = vec![];
+                    for (arg_name, arg_type) in args {
+                        params.push(FunctionParameter::new(
+                            arg_type.clone(),
+                            arg_name.clone(),
+                            None,
+                        ));
+                    }
+                    let func = Type::function(ret.as_ref(), params, false);
+                    let func_ptr = Type::pointer(
+                        &bv.default_arch().expect("Could not find default arch"),
+                        func.as_ref(),
+                    );
+                    vtable_builder.append(
+                        func_ptr.as_ref(),
+                        name,
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
                 }
-                let func = Type::function(ret.as_ref(), params, false);
-                let func_ptr = Type::pointer(
-                    &bv.default_arch().expect("Could not find default arch"),
-                    func.as_ref(),
+            }
+
+            let vtable_structure = Type::structure(&vtable_builder.finalize());
+            bv.define_user_type(&vtable_name, &vtable_structure);
+            vtable_names.push(vtable_name);
+        } else {
+            // Has inheritance - create vtables for each base class
+            for (i, base_class) in self.base_classes.iter().enumerate() {
+                let vtable_name = format!("{}_vtable_{}", self.name, base_class);
+                let base_vtable_name = format!("{}_vtable", base_class);
+
+                let mut vtable_builder = StructureBuilder::new();
+
+                // Add base class vtable as base structure and set proper width
+                let mut base_vtable_width = 0u64;
+                if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
+                    let base_vtable_ref = NamedTypeReference::new_with_id(
+                        NamedTypeReferenceClass::StructNamedTypeClass,
+                        &base_vtable_type_id,
+                        &base_vtable_name,
+                    );
+
+                    // Get the width of the base vtable
+                    if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
+                        base_vtable_width = base_vtable_type.width();
+                    }
+
+                    let base_struct = BaseStructure::new(base_vtable_ref, 0, base_vtable_width);
+                    vtable_builder.base_structures(&[base_struct]);
+
+                    // Set the vtable builder width to account for the base vtable
+                    vtable_builder.width(base_vtable_width);
+                }
+
+                // Add new methods from current class only to the first base class vtable
+                if i == 0 {
+                    for method in &self.vtable_methods {
+                        if let Member::Function { name, ret, args } = method {
+                            let mut params = vec![];
+                            for (arg_name, arg_type) in args {
+                                params.push(FunctionParameter::new(
+                                    arg_type.clone(),
+                                    arg_name.clone(),
+                                    None,
+                                ));
+                            }
+                            let func = Type::function(ret.as_ref(), params, false);
+                            let func_ptr = Type::pointer(
+                                &bv.default_arch().expect("Could not find default arch"),
+                                func.as_ref(),
+                            );
+                            vtable_builder.append(
+                                func_ptr.as_ref(),
+                                name,
+                                MemberAccess::PublicAccess,
+                                MemberScope::NoScope,
+                            );
+                        }
+                    }
+                }
+
+                // Define the inherited vtable structure
+                let vtable_structure = Type::structure(&vtable_builder.finalize());
+                bv.define_user_type(&vtable_name, &vtable_structure);
+                vtable_names.push(vtable_name);
+            }
+        }
+
+        // Now create the main class structure
+        let mut class_builder = StructureBuilder::new();
+
+        // Step 1: Add base class members using base_structures with proper offset and width
+        let mut base_structures = Vec::new();
+        let mut cumulative_width = 0u64;
+
+        for base_class in &self.base_classes {
+            if let Some(base_type_id) = bv.type_id_by_name(base_class) {
+                let base_ref = NamedTypeReference::new_with_id(
+                    NamedTypeReferenceClass::StructNamedTypeClass,
+                    &base_type_id,
+                    base_class,
                 );
-                vtable_builder.append(
-                    func_ptr.as_ref(),
-                    name,
+
+                // Get the width of this base class
+                let base_width = if let Some(base_type) = bv.type_by_id(&base_type_id) {
+                    base_type.width()
+                } else {
+                    0
+                };
+
+                let base_struct = BaseStructure::new(base_ref, cumulative_width, base_width);
+                base_structures.push(base_struct);
+
+                // Update cumulative width for next base class
+                cumulative_width += base_width;
+            }
+        }
+
+        if !base_structures.is_empty() {
+            class_builder.base_structures(&base_structures);
+            // Set the class builder width to the cumulative width of all base structures
+            class_builder.width(cumulative_width);
+        }
+
+        // Step 2: Override base class vtables
+        if !self.base_classes.is_empty() {
+            let mut current_offset = 0;
+
+            for (i, base_class) in self.base_classes.iter().enumerate() {
+                if let Some(vtable_name) = vtable_names.get(i) {
+                    // Create vtable pointer
+                    let vtable_ptr = Type::pointer(
+                        &bv.default_arch().expect("Could not find default arch"),
+                        &Type::named_type(&NamedTypeReference::new(
+                            NamedTypeReferenceClass::StructNamedTypeClass,
+                            vtable_name,
+                        )),
+                    );
+
+                    // Insert vtable at the start of this base class (current_offset)
+                    let vtable_member_name = format!("vtable_{}", base_class);
+                    class_builder.insert(
+                        vtable_ptr.as_ref(),
+                        &vtable_member_name,
+                        current_offset,
+                        true,
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+
+                    // Update offset for next base class using the actual size/width
+                    if let Some(base_type_id) = bv.type_id_by_name(base_class) {
+                        if let Some(base_type) = bv.type_by_id(&base_type_id) {
+                            current_offset += base_type.width();
+                        }
+                    }
+                }
+            }
+        } else if !self.vtable_methods.is_empty() {
+            // Regular class with vtable - insert at offset 0
+            if let Some(vtable_name) = vtable_names.get(0) {
+                let vtable_ptr = Type::pointer(
+                    &bv.default_arch().expect("Could not find default arch"),
+                    &Type::named_type(&NamedTypeReference::new(
+                        NamedTypeReferenceClass::StructNamedTypeClass,
+                        vtable_name,
+                    )),
+                );
+                class_builder.insert(
+                    vtable_ptr.as_ref(),
+                    "vtable",
+                    0,
+                    true,
                     MemberAccess::PublicAccess,
                     MemberScope::NoScope,
                 );
             }
         }
 
-        // Define the vtable structure
-        let vtable_structure = Type::structure(&vtable_builder.finalize());
-        bv.define_user_type(&vtable_name, &vtable_structure);
-
-        // Now create the main class structure
-        let mut class_builder = StructureBuilder::new();
-
-        // Add vtable pointer as the first member
-        if !self.vtable_methods.is_empty() {
-            let vtable_ptr = Type::pointer(
-                &bv.default_arch().expect("Could not find default arch"),
-                &Type::named_type(&NamedTypeReference::new(
-                    NamedTypeReferenceClass::StructNamedTypeClass,
-                    &vtable_name,
-                )),
-            );
-            class_builder.append(
-                vtable_ptr.as_ref(),
-                "vtable",
-                MemberAccess::PublicAccess,
-                MemberScope::NoScope,
-            );
-        }
-
-        // Add member variables
+        // Step 3: Add member variables specific to this class
         for member in &self.member_variables {
             match member {
                 Member::Basic {
@@ -568,7 +704,15 @@ impl Member {
                     t,
                 );
                 println!("Found named type {:?}", named_ref);
-                Type::named_type(&named_ref)
+                // Hack: `Type::named_type(&named_ref)` always returns
+                // a reference with width 0, making any member structs
+                // (that are not pointers to structs) appear with 0 size
+                Type::named_type_from_type(
+                    named_ref.name(),
+                    bv.type_by_ref(&named_ref)
+                        .expect("Could not find type by ref")
+                        .as_ref(),
+                )
             } else {
                 panic!("Could not find type: {}", t);
             }

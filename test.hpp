@@ -10,6 +10,10 @@ struct ddd {
   void* (*f)(void*, int32_t);
 };
 
+struct aaa {
+  Zyx_abc innards;
+};
+
 struct ccc {
   Zyx_abc* a;
 };
@@ -67,4 +71,28 @@ class III {
   // ; end vtable
   bool arg1;
   char* unk;
+};
+
+class JJJ : HHH {
+  // ; end vtable
+  uint32_t jjj_member;
+};
+
+class KK : HHH, III {
+  // ; end vtable
+  uint32_t kk_member;
+};
+
+class LLL {
+  LLL();
+  ~LLL();
+  bool testNum(ggg num); // ; offset=1
+  // ; end vtable
+  ggg num;
+};
+
+class MMM : HHH, III, LLL {
+  uint32_t getVal();
+  // ; end vtable
+  uint32_t MMM_val;
 };

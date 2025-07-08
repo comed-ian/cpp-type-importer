@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "binaryninja"
 version = "0.1.0"
-source = "git+https://github.com/Vector35/binaryninja-api.git?tag=dev%2F5.1.7863#768f7c78465fb93936e5ca50a0ca712664fe54e7"
+source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#01ec263e92c250371d0b4e31a5b5621de3f25f02"
 dependencies = [
  "binaryninjacore-sys",
  "log",
@@ -25,7 +25,7 @@ dependencies = [
 [[package]]
 name = "binaryninjacore-sys"
 version = "0.1.0"
-source = "git+https://github.com/Vector35/binaryninja-api.git?tag=dev%2F5.1.7863#768f7c78465fb93936e5ca50a0ca712664fe54e7"
+source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#01ec263e92c250371d0b4e31a5b5621de3f25f02"
 dependencies = [
  "bindgen",
  "proc-macro2",
