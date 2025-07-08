@@ -118,7 +118,7 @@ impl<'a> Structure {
                 } => {
                     builder.append(
                         typ.as_ref(),
-                        name.clone(),
+                        &name.clone(),
                         MemberAccess::PublicAccess,
                         MemberScope::NoScope,
                     );
@@ -140,7 +140,7 @@ impl<'a> Structure {
                     );
                     builder.append(
                         func.as_ref(),
-                        name.clone(),
+                        &name.clone(),
                         MemberAccess::PublicAccess,
                         MemberScope::NoScope,
                     );
@@ -191,7 +191,7 @@ impl Member {
             if let Some(type_id) = bv.type_id_by_name(t) {
                 let named_ref = NamedTypeReference::new_with_id(
                     NamedTypeReferenceClass::StructNamedTypeClass,
-                    type_id,
+                    &type_id,
                     t,
                 );
                 println!("Found named type {:?}", named_ref);
