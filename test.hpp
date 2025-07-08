@@ -74,6 +74,8 @@ class III {
 };
 
 class JJJ : HHH {
+  JJJ(); // ; override void (* HHH_vtable::HHH)(struct HHH* this);
+  ~JJJ(); // ; override void (* HHH_vtable::~HHH)(struct HHH* this);
   // ; end vtable
   uint32_t jjj_member;
 };

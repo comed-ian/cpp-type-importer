@@ -232,7 +232,7 @@ impl<'a> Structure {
 #[derive(Debug)]
 pub struct Class {
     name: String,
-    vtable_methods: Vec<Member>,
+    vtable_methods: Vec<(Member, Option<String>)>, // Store method and override info
     member_variables: Vec<Member>,
     base_classes: Vec<String>, // Store base class names for now
 }
@@ -285,8 +285,8 @@ impl<'a> Class {
 
             if in_vtable {
                 // Parse vtable method
-                if let Some(method) = Self::parse_vtable_method(line, bv, &name) {
-                    vtable_methods.push(method);
+                if let Some((method, override_info)) = Self::parse_vtable_method(line, bv, &name) {
+                    vtable_methods.push((method, override_info));
                 }
             } else {
                 // Parse member variable
@@ -303,7 +303,11 @@ impl<'a> Class {
         }
     }
 
-    fn parse_vtable_method(line: &str, bv: &'a BinaryView, class_name: &str) -> Option<Member> {
+    fn parse_vtable_method(
+        line: &str,
+        bv: &'a BinaryView,
+        class_name: &str,
+    ) -> Option<(Member, Option<String>)> {
         // Parse offset comment with regex
         let offset_regex = Regex::new(r"//\s*;\s*offset=(-?\d+)").unwrap();
         let this_offset = if let Some(captures) = offset_regex.captures(line) {
@@ -317,11 +321,25 @@ impl<'a> Class {
             Some(0) // Default: this is at position 0
         };
 
-        // Remove the offset comment from the line
-        let clean_line = offset_regex.replace(line, "").trim().to_string();
+        // Parse override comment with regex
+        let override_regex = Regex::new(r"//\s*;\s*override\s+(.+?);").unwrap();
+        let override_info = if let Some(captures) = override_regex.captures(line) {
+            Some(captures.get(1).unwrap().as_str().to_string())
+        } else {
+            None
+        };
+
+        // Remove both offset and override comments from the line
+        let clean_line = offset_regex.replace(line, "");
+        let clean_line = override_regex.replace(&clean_line, "").trim().to_string();
 
         // Parse method signature and inject this pointer
-        Self::parse_method_signature(&clean_line, bv, this_offset, class_name)
+        if let Some(member) = Self::parse_method_signature(&clean_line, bv, this_offset, class_name)
+        {
+            Some((member, override_info))
+        } else {
+            None
+        }
     }
 
     fn parse_method_signature(
@@ -432,6 +450,125 @@ impl<'a> Class {
         }
     }
 
+    fn process_vtable_methods_for_base(
+        vtable_methods: &[(Member, Option<String>)],
+        vtable_builder: &mut StructureBuilder,
+        base_class: &str,
+        process_non_overriding: bool,
+        bv: &'a BinaryView,
+    ) {
+        for (method, override_info) in vtable_methods {
+            if let Member::Function { name, ret, args } = method {
+                let mut params = vec![];
+                for (arg_name, arg_type) in args {
+                    params.push(FunctionParameter::new(
+                        arg_type.clone(),
+                        arg_name.clone(),
+                        None,
+                    ));
+                }
+                let func = Type::function(ret.as_ref(), params, false);
+                let func_ptr = Type::pointer(
+                    &bv.default_arch().expect("Could not find default arch"),
+                    func.as_ref(),
+                );
+
+                if let Some(override_str) = override_info {
+                    // Check if this override targets the current base class
+                    println!("OVERRIDE STR {override_str}");
+                    if Self::is_override_for_base_class(override_str, base_class) {
+                        println!("FINDING OFFSET IN THIS CURRENT CLASS {base_class}");
+                        // Parse the override information to find the target method
+                        if let Some(offset) =
+                            Self::parse_override_offset(override_str, base_class, bv)
+                        {
+                            // Override at specific offset
+                            vtable_builder.insert(
+                                func_ptr.as_ref(),
+                                name,
+                                offset,
+                                true, // overwrite existing
+                                MemberAccess::PublicAccess,
+                                MemberScope::NoScope,
+                            );
+                        }
+                    }
+                } else if process_non_overriding {
+                    // No override, add to vtable only if processing non-overriding methods
+                    vtable_builder.append(
+                        func_ptr.as_ref(),
+                        name,
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_override_for_base_class(override_str: &str, base_class: &str) -> bool {
+        // Check if the override string contains the base class vtable name
+        let base_vtable_name = format!("{}_vtable", base_class);
+        override_str.contains(&base_vtable_name)
+    }
+
+    fn parse_override_offset(
+        override_str: &str,
+        base_class: &str,
+        bv: &'a BinaryView,
+    ) -> Option<u64> {
+        // Parse override string like "void (* HHH_vtable::HHH)(struct HHH* this)"
+        // Look for the base class vtable and method name
+        let base_vtable_name = format!("{}_vtable", base_class);
+
+        // Find the vtable type and look for the method
+        if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
+            if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
+                // Get the structure members to find the method offset
+                if let Some(structure) = base_vtable_type.get_structure() {
+                    // Parse the method name from the override string
+                    if let Some(cleaned_override) =
+                        Self::extract_method_name_from_override(override_str)
+                    {
+                        // Find the method in the base vtable structure by reconstructing the signature
+                        for (i, member) in structure.members().iter().enumerate() {
+                            let mut contents = member.ty.contents.to_string();
+
+                            // Find (*) and insert the member name after the *
+                            if let Some(star_pos) = contents.find("(*)") {
+                                contents.insert_str(star_pos + 2, &format!(" {}", member.name));
+                            }
+
+                            println!(
+                                "Checking cleaned override '{}' against reconstructed '{}'",
+                                cleaned_override, contents
+                            );
+
+                            if cleaned_override == contents {
+                                println!("GOT MATCH");
+                                // Return the offset in bytes (assuming pointer size)
+                                let pointer_size = bv
+                                    .default_arch()
+                                    .expect("Could not find default arch")
+                                    .address_size();
+                                return Some((i as u64) * (pointer_size as u64));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_method_name_from_override(override_str: &str) -> Option<String> {
+        // Parse override string like "void (* HHH_vtable::HHH)(struct HHH* this)"
+        // Remove the inherited XXX_vtable:: prefix while keeping the rest
+        let regex = Regex::new(r"\w+_vtable::").unwrap();
+        let cleaned = regex.replace_all(override_str, "");
+        Some(cleaned.to_string())
+    }
+
     pub fn define(&self, bv: &'a BinaryView) -> bool {
         // Create vtables for each base class
         let mut vtable_names = Vec::new();
@@ -441,7 +578,7 @@ impl<'a> Class {
             let vtable_name = format!("{}_vtable", self.name);
             let mut vtable_builder = StructureBuilder::new();
 
-            for method in &self.vtable_methods {
+            for (method, _override_info) in &self.vtable_methods {
                 if let Member::Function { name, ret, args } = method {
                     let mut params = vec![];
                     for (arg_name, arg_type) in args {
@@ -497,32 +634,14 @@ impl<'a> Class {
                     vtable_builder.width(base_vtable_width);
                 }
 
-                // Add new methods from current class only to the first base class vtable
-                if i == 0 {
-                    for method in &self.vtable_methods {
-                        if let Member::Function { name, ret, args } = method {
-                            let mut params = vec![];
-                            for (arg_name, arg_type) in args {
-                                params.push(FunctionParameter::new(
-                                    arg_type.clone(),
-                                    arg_name.clone(),
-                                    None,
-                                ));
-                            }
-                            let func = Type::function(ret.as_ref(), params, false);
-                            let func_ptr = Type::pointer(
-                                &bv.default_arch().expect("Could not find default arch"),
-                                func.as_ref(),
-                            );
-                            vtable_builder.append(
-                                func_ptr.as_ref(),
-                                name,
-                                MemberAccess::PublicAccess,
-                                MemberScope::NoScope,
-                            );
-                        }
-                    }
-                }
+                // Process vtable methods for this base class
+                Self::process_vtable_methods_for_base(
+                    &self.vtable_methods,
+                    &mut vtable_builder,
+                    base_class,
+                    i == 0, // Only process methods for the first base class
+                    bv,
+                );
 
                 // Define the inherited vtable structure
                 let vtable_structure = Type::structure(&vtable_builder.finalize());
