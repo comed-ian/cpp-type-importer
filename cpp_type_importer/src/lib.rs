@@ -229,11 +229,310 @@ impl<'a> Structure {
     }
 }
 
+#[derive(Debug)]
 pub struct Class {
     name: String,
-    members: Vec<Member>,
-    fns: Vec<Member>,
-    base_classes: Vec<Class>,
+    vtable_methods: Vec<Member>,
+    member_variables: Vec<Member>,
+    base_classes: Vec<String>, // Store base class names for now
+}
+
+impl<'a> Class {
+    pub fn new(def: &str, body: &str, bv: &'a BinaryView) -> Self {
+        // Parse class name and inheritance with regex
+        let class_regex = Regex::new(r"class\s+(\w+)(?:\s*:\s*(.+))?").unwrap();
+        let (name, base_classes) = if let Some(captures) = class_regex.captures(def) {
+            let class_name = captures.get(1).unwrap().as_str().to_string();
+            let base_classes = if let Some(inheritance) = captures.get(2) {
+                // Parse inherited classes (split by comma or space)
+                inheritance
+                    .as_str()
+                    .split_whitespace()
+                    .filter(|s| {
+                        !s.is_empty() && *s != "public" && *s != "private" && *s != "protected"
+                    })
+                    .map(|s| s.trim_end_matches(',').to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (class_name, base_classes)
+        } else {
+            // Fallback to existing parse_name logic
+            let name = parse_name(def).expect(&format!("Could not parse class name from {def}"));
+            (name, Vec::new())
+        };
+
+        // Forward-declare the class as a structure so it can be referenced in constructor signatures
+        let forward_decl = Type::structure(&StructureBuilder::new().finalize());
+        bv.define_user_type(&name, &forward_decl);
+
+        let mut vtable_methods = Vec::new();
+        let mut member_variables = Vec::new();
+        let mut in_vtable = true;
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Check for end of vtable marker
+            if line.contains("// ; end vtable") {
+                in_vtable = false;
+                continue;
+            }
+
+            if in_vtable {
+                // Parse vtable method
+                if let Some(method) = Self::parse_vtable_method(line, bv, &name) {
+                    vtable_methods.push(method);
+                }
+            } else {
+                // Parse member variable
+                let member = Member::new(line, bv, None, None);
+                member_variables.push(member);
+            }
+        }
+
+        Self {
+            name,
+            vtable_methods,
+            member_variables,
+            base_classes,
+        }
+    }
+
+    fn parse_vtable_method(line: &str, bv: &'a BinaryView, class_name: &str) -> Option<Member> {
+        // Parse offset comment with regex
+        let offset_regex = Regex::new(r"//\s*;\s*offset=(-?\d+)").unwrap();
+        let this_offset = if let Some(captures) = offset_regex.captures(line) {
+            let offset_str = captures.get(1).unwrap().as_str();
+            if offset_str == "-1" {
+                None // Static method
+            } else {
+                offset_str.parse::<usize>().ok()
+            }
+        } else {
+            Some(0) // Default: this is at position 0
+        };
+
+        // Remove the offset comment from the line
+        let clean_line = offset_regex.replace(line, "").trim().to_string();
+
+        // Parse method signature and inject this pointer
+        Self::parse_method_signature(&clean_line, bv, this_offset, class_name)
+    }
+
+    fn parse_method_signature(
+        line: &str,
+        bv: &'a BinaryView,
+        this_offset: Option<usize>,
+        class_name: &str,
+    ) -> Option<Member> {
+        let line = line.trim();
+
+        // Create this pointer type string for injection
+        let this_param = format!("{class_name}* this");
+
+        // Check for destructor: ~ClassName()
+        if line.starts_with('~') && line.contains(&format!("~{class_name}")) {
+            let method_signature = if this_offset.is_some() {
+                format!("void (*~{class_name})({this_param});")
+            } else {
+                format!("void (*~{class_name})();")
+            };
+            return Member::new(&method_signature, bv, None, None).into();
+        }
+
+        // Check for constructor: ClassName(...)
+        if let Some(paren_pos) = line.find('(') {
+            let potential_constructor = line[..paren_pos].trim();
+            if potential_constructor == class_name {
+                let params_str = &line[paren_pos + 1..line.rfind(')').unwrap_or(line.len())];
+
+                // Parse all parameters first
+                let mut all_params = if params_str.is_empty() {
+                    Vec::new()
+                } else if let Some(params) = parse_template_instantiation(params_str) {
+                    params
+                } else {
+                    // Fallback to simple splitting if parsing fails
+                    params_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect()
+                };
+
+                // Insert this pointer at the specified offset
+                if let Some(offset) = this_offset {
+                    let insert_pos = if offset <= all_params.len() {
+                        offset
+                    } else {
+                        all_params.len()
+                    };
+                    all_params.insert(insert_pos, this_param);
+                }
+
+                let method_signature = if all_params.is_empty() {
+                    format!("void (*{class_name})();")
+                } else {
+                    format!("void (*{class_name})({});", all_params.join(", "))
+                };
+
+                return Member::new(&method_signature, bv, None, None).into();
+            }
+        }
+
+        // For regular methods, inject this pointer at the specified offset
+        if let Some(paren_pos) = line.find('(') {
+            let before_paren = &line[..paren_pos];
+            let params_str = &line[paren_pos + 1..line.rfind(')').unwrap_or(line.len())];
+
+            // Parse all parameters first
+            let mut all_params = if params_str.is_empty() {
+                Vec::new()
+            } else if let Some(params) = parse_template_instantiation(params_str) {
+                params
+            } else {
+                // Fallback to simple splitting if parsing fails
+                params_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            };
+
+            // Insert this pointer at the specified offset
+            if let Some(offset) = this_offset {
+                let insert_pos = if offset <= all_params.len() {
+                    offset
+                } else {
+                    all_params.len()
+                };
+                all_params.insert(insert_pos, this_param);
+            }
+
+            // Extract method name from before_paren
+            let parts: Vec<&str> = before_paren.trim().split_whitespace().collect();
+            let (return_type, method_name) = if parts.len() >= 2 {
+                (parts[..parts.len() - 1].join(" "), parts[parts.len() - 1])
+            } else {
+                ("void".to_string(), parts[0])
+            };
+
+            let method_signature = if all_params.is_empty() {
+                format!("{return_type} (*{method_name})();")
+            } else {
+                format!("{return_type} (*{method_name})({});", all_params.join(", "))
+            };
+
+            Member::new(&method_signature, bv, None, None).into()
+        } else {
+            None
+        }
+    }
+
+    pub fn define(&self, bv: &'a BinaryView) -> bool {
+        // First, create and define the vtable structure
+        let vtable_name = format!("{}_vtable", self.name);
+        let mut vtable_builder = StructureBuilder::new();
+
+        for method in &self.vtable_methods {
+            if let Member::Function { name, ret, args } = method {
+                // Create function pointer type for vtable entry
+                let mut params = vec![];
+                for (arg_name, arg_type) in args {
+                    params.push(FunctionParameter::new(
+                        arg_type.clone(),
+                        arg_name.clone(),
+                        None,
+                    ));
+                }
+                let func = Type::function(ret.as_ref(), params, false);
+                let func_ptr = Type::pointer(
+                    &bv.default_arch().expect("Could not find default arch"),
+                    func.as_ref(),
+                );
+                vtable_builder.append(
+                    func_ptr.as_ref(),
+                    name,
+                    MemberAccess::PublicAccess,
+                    MemberScope::NoScope,
+                );
+            }
+        }
+
+        // Define the vtable structure
+        let vtable_structure = Type::structure(&vtable_builder.finalize());
+        bv.define_user_type(&vtable_name, &vtable_structure);
+
+        // Now create the main class structure
+        let mut class_builder = StructureBuilder::new();
+
+        // Add vtable pointer as the first member
+        if !self.vtable_methods.is_empty() {
+            let vtable_ptr = Type::pointer(
+                &bv.default_arch().expect("Could not find default arch"),
+                &Type::named_type(&NamedTypeReference::new(
+                    NamedTypeReferenceClass::StructNamedTypeClass,
+                    &vtable_name,
+                )),
+            );
+            class_builder.append(
+                vtable_ptr.as_ref(),
+                "vtable",
+                MemberAccess::PublicAccess,
+                MemberScope::NoScope,
+            );
+        }
+
+        // Add member variables
+        for member in &self.member_variables {
+            match member {
+                Member::Basic {
+                    name,
+                    typ,
+                    comments: _,
+                } => {
+                    class_builder.append(
+                        typ.as_ref(),
+                        name,
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+                Member::Function { name, ret, args } => {
+                    // Handle function pointers in member variables
+                    let mut params = vec![];
+                    for (arg_name, arg_type) in args {
+                        params.push(FunctionParameter::new(
+                            arg_type.clone(),
+                            arg_name.clone(),
+                            None,
+                        ));
+                    }
+                    let func = Type::function(ret.as_ref(), params, false);
+                    let func_ptr = Type::pointer(
+                        &bv.default_arch().expect("Could not find default arch"),
+                        func.as_ref(),
+                    );
+                    class_builder.append(
+                        func_ptr.as_ref(),
+                        name,
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+                _ => (),
+            }
+        }
+
+        // Define the class structure
+        let class_structure = Type::structure(&class_builder.finalize());
+        bv.define_user_type(&self.name, &class_structure);
+
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -682,7 +981,11 @@ impl<'a> Parser<'a> {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
-                            dbg!(format!("Got class {s2}"));
+                            dbg!("Got class");
+                            dbg!(format!("{s}: {s2}"));
+                            let class = Class::new(s, s2, self.bv);
+                            dbg!(format!("{class:?}"));
+                            class.define(self.bv);
                             idx += i2 + 1;
                         } else if s.starts_with("enum") {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)

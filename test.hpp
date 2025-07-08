@@ -48,3 +48,23 @@ enum ggg {
   GGGONE,
   GGGTWO
 };
+
+class HHH {
+  HHH();
+  HHH(int32_t);
+  ~HHH();
+  bool myMethod(uint32_t*);
+  // ; end vtable
+  uint32_t a;
+  Zyx_abc* b;
+  void* (*cb)();
+};
+
+class III {
+  III();
+  ~III();
+  bool MyMethod(uint32_t* a); // ; offset=1
+  // ; end vtable
+  bool arg1;
+  char* unk;
+};
