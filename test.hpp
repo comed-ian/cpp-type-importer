@@ -22,3 +22,17 @@ template <typename T, typename UV> struct Abc {
 Abc<int32_t, bool>;
 
 Abc<Abc<int32_t, bool>, int32_t>;
+
+Abc<uint32_t, uint32_t*>;
+
+template <typename A> struct Def {
+  Abc<A, A*> a;
+};
+
+Def<uint32_t>;
+
+template <typename T> struct eee {
+  void* (*fn)(T* clazz);
+};
+
+eee<Zyx_abc>;

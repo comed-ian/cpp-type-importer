@@ -43,7 +43,7 @@ pub struct Template {
     body: String,
 }
 
-impl Template {
+impl<'a> Template {
     pub fn new(def: &str, body: &str, typenames: Vec<String>) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse name from {def}"));
         Self {
@@ -52,20 +52,30 @@ impl Template {
             body: body.to_string(),
         }
     }
-    pub fn define(&self, typenames: Vec<String>) {
+    pub fn define<'b>(&self, typenames: Vec<String>, bv: &'a BinaryView) {
         assert_eq!(
             typenames.len(),
             self.typenames.len(),
             "Provided typenames length does not match expected typenames length"
         );
-        for member in self.body.lines() {
-            if let Some((typ, name, depth)) = parse_member_definition(member) {
-                dbg!(format!("GOT MEMBER DEFINITION {typ} {name} {depth}"));
-            } else {
-                dbg!(format!("Failed to parse member defintion {member}"));
-            }
-        }
         let mut members = Vec::<Member>::new();
+        for member in self.body.lines() {
+            if member.trim() == "" {
+                continue;
+            }
+            println!("Member {member}");
+            members.push(Member::new(
+                member,
+                bv,
+                Some(&self.typenames),
+                Some(&typenames),
+            ));
+        }
+        let mut name = self.name.clone();
+        name.push('<');
+        name.push_str(&typenames.join(", "));
+        name.push('>');
+        Structure::new_from_members(name, members, 0).define(bv);
     }
 }
 
@@ -81,13 +91,20 @@ impl<'a> Structure {
         let name = parse_name(def).expect(&format!("Could not parse definition {def} for name"));
         let mut members = vec![];
         for member in body.lines() {
-            members.push(Member::new(member, bv));
+            members.push(Member::new(member, bv, None, None));
         }
 
         Self {
             name,
             members,
             offset: 0,
+        }
+    }
+    pub fn new_from_members(name: String, members: Vec<Member>, offset: u16) -> Self {
+        Self {
+            name,
+            members,
+            offset,
         }
     }
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
@@ -191,8 +208,13 @@ impl Member {
         }
         typ
     }
-    fn new(def: &str, bv: &BinaryView) -> Self {
-        let (typ, name, depth) =
+    fn new(
+        def: &str,
+        bv: &BinaryView,
+        template_members: Option<&Vec<String>>,
+        template_defs: Option<&Vec<String>>,
+    ) -> Self {
+        let (mut typ, name, depth) =
             parse_member_definition(def).expect("Could not parse member definition");
         dbg!(format!("GOT MEMBER DEFINITION {typ} {name} {depth}"));
         if let Some(_) = is_primitive(&typ) {
@@ -203,9 +225,27 @@ impl Member {
                 comments: vec![],
             };
         } else {
+            let mut def = def.to_string();
+            // Try and replace templated member types, if they exist
+            if let Some(t_members) = template_members {
+                let t_defs = template_defs.unwrap();
+                let mut tokens = parse_template_member_definition(&def);
+                println!("{tokens:?}");
+
+                // Replace template parameters with their concrete types
+                for token in &mut tokens {
+                    if let Some(index) = t_members.iter().position(|t| t == token) {
+                        *token = t_defs[index].clone();
+                    }
+                }
+
+                // Reconstruct the type string with substituted parameters
+                def = tokens.join("");
+                println!("Substituted type: {def}");
+            }
             // Try to match function definition: return_type (*name)(args)
             let func_regex = Regex::new(r"(.*) \(\*(.*)\)\((.*)\)").unwrap();
-            if let Some(captures) = func_regex.captures(def) {
+            if let Some(captures) = func_regex.captures(&def) {
                 let return_type = captures.get(1).unwrap().as_str().trim();
                 let name = captures.get(2).unwrap().as_str().trim();
                 let args = captures.get(3).unwrap().as_str().trim();
@@ -234,7 +274,7 @@ impl Member {
                 };
             } else {
                 let (typ, name, depth) =
-                    parse_member_definition(def).expect(&format!("Could not parse {def}"));
+                    parse_member_definition(&def).expect(&format!("Could not parse {def}"));
                 let typ = Self::define_type(&typ, depth, bv);
                 return Member::Basic {
                     name,
@@ -244,6 +284,30 @@ impl Member {
             }
         }
     }
+}
+
+fn parse_template_member_definition(s: &str) -> Vec<String> {
+    let mut curr = String::new();
+    let mut typenames = Vec::<String>::new();
+    for c in s.chars() {
+        match c {
+            '<' | '>' | '*' | ',' | ' ' | '(' | ')' => {
+                if !curr.is_empty() {
+                    typenames.push(curr);
+                    curr = String::new();
+                }
+                typenames.push(c.to_string());
+            }
+            _ => curr.push(c),
+        }
+    }
+
+    // get last item if not empty
+    if !curr.is_empty() {
+        typenames.push(curr);
+    }
+
+    typenames
 }
 
 // Parses template instantiation `temp<type1, type2<type3, type4>>`, etc. The input
@@ -510,10 +574,10 @@ impl<'a> Parser<'a> {
                 }
                 // structure, template, class definition
                 // get closing token and index
-                let (i2, _, mut s2) =
-                    find_closing_token(&contents[idx..], c).expect("Could not find closing token");
-                s2 = s2.trim();
                 if s.starts_with("#include") {
+                    let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                        .expect("Could not find closing token");
+                    s2 = s2.trim();
                     // throw out include statements
                     assert!(c == '<' || c == '"');
                     dbg!(format!("Skipping {s} {s2}"));
@@ -524,6 +588,9 @@ impl<'a> Parser<'a> {
                     '<' => {
                         // template
                         if s.starts_with("template") {
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                                .expect("Could not find closing token");
+                            s2 = s2.trim();
                             // template definition, store for later declarations
                             dbg!(format!("Got template type {s2}"));
                             let typenames = parse_template_definition(s2)
@@ -541,54 +608,65 @@ impl<'a> Parser<'a> {
                             let t = Template::new(s3, body, typenames);
                             println!("{:?}", t);
                             templates.push(t);
+                            idx += i2 + 1;
                         } else {
-                            let (i3, _, mut s3) =
-                                find_closing_token(&contents[idx + i2 + 1..], ';').expect(
-                                    "Could not find closing token for template instantiation",
-                                );
-                            if let Some(stripped) = s3.strip_suffix('>') {
-                                s3 = stripped;
+                            // s looks like `structname<`. Find closing `;` to get the contents
+                            // within the angled brackets.
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], ';')
+                                .expect("Could not find closing token for template instantiation");
+                            println!("{s} {s2}");
+                            if let Some(stripped) = s2.strip_suffix('>') {
+                                s2 = stripped;
                             }
-                            let mut instant = s2.to_string();
-                            instant.push('>');
-                            instant.push_str(s3);
-                            dbg!(format!("Got template instantiation {instant}"));
-
-                            let typenames = parse_template_instantiation(&instant)
-                                .expect(&format!("Could not parse template definitions {s2}>{s3}"));
+                            dbg!(format!("Got template instantiation {s2}"));
+                            let typenames = parse_template_instantiation(s2)
+                                .expect(&format!("Could not parse template definitions {s2}"));
                             dbg!(format!("{typenames:?}"));
                             // check for template named `s` to declare
                             let t = templates
                                 .iter()
                                 .find(|x| &x.name == s.trim())
                                 .expect(&format!("Could not find template {s} for definition"));
-                            t.define(typenames);
-                            idx += i3 + 1
+                            t.define(typenames, self.bv);
+                            println!("{idx}");
+                            idx += i2 + 1;
+                            println!("{idx}");
                         }
                     }
                     ';' => {
                         // forward declaration
+                        let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                            .expect("Could not find closing token");
+                        s2 = s2.trim();
                         dbg!(format!("Got forward declaration {s2}"));
+                        idx += i2 + 1;
                     }
                     '{' => {
                         // class or struct definition
                         if s.starts_with("struct") {
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                                .expect("Could not find closing token");
+                            s2 = s2.trim();
                             dbg!("Got struct");
                             dbg!(format!("{s}: {s2}"));
                             let mut structure = Structure::new(s, s2, self.bv);
                             dbg!(format!("{structure:?}",));
                             structure.define(self.bv);
+                            idx += i2 + 1;
 
                             // for l in s2.lines() {
                             //     dbg!(format!("Got Member {:#?}", Member::parse(l, vec![])));
                             // }
                         } else if s.starts_with("class") {
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                                .expect("Could not find closing token");
+                            s2 = s2.trim();
                             dbg!(format!("Got class {s2}"));
+                            idx += i2 + 1;
                         }
                     }
                     _ => (),
                 }
-                idx += i2 + 1;
             } else {
                 break;
             }
