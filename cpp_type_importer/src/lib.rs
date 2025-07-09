@@ -1,14 +1,12 @@
 use binaryninja::architecture::CoreArchitecture;
 use binaryninja::binary_view::BinaryViewExt;
 use binaryninja::command::{register_command, Command};
-use binaryninja::high_level_il::operation::DerefFieldSsa;
 // use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
 use binaryninja::types::{
-    BaseStructure, Enumeration, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
+    BaseStructure, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
     NamedTypeReference, NamedTypeReferenceClass, StructureBuilder, Type,
 };
-use binaryninja::update::time_since_last_update_check;
 use binaryninja::{architecture::Architecture, binary_view::BinaryView};
 use log::{error, info, LevelFilter};
 use regex::Regex;
@@ -16,6 +14,14 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
+/// Maps C++ primitive type names to Binary Ninja types
+///
+/// # Arguments
+/// * `s` - The C++ primitive type name as a string
+///
+/// # Returns
+/// * `Some(Ref<Type>)` - Binary Ninja type reference if the type is primitive
+/// * `None` - If the type is not a recognized primitive
 fn is_primitive(s: &str) -> Option<Ref<Type>> {
     match s {
         "char" => Some(Type::int(1, true)),
@@ -36,26 +42,38 @@ fn is_primitive(s: &str) -> Option<Ref<Type>> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Template {
-    name: String,
-    typenames: Vec<String>,
-    body: String,
-}
-
+/// Represents a C++ enum with values and size specification
+///
+/// This structure stores enum name, underlying type size, and value mappings
+/// to support Binary Ninja enum type creation.
 #[derive(Debug, Clone)]
 pub struct Enum {
+    /// The name of the enum type
     name: String,
-    size: u64,
+    /// The size of the underlying type in bytes
+    size: u8,
+    /// List of enum values as (name, numeric_value) pairs
     values: Vec<(String, u64)>,
 }
 
 impl<'a> Enum {
-    pub fn new(name: &str, size: u64, body: &str) -> Self {
+    /// Creates a new enum from its definition
+    ///
+    /// # Arguments
+    /// * `name` - The enum name
+    /// * `size` - Size in bytes of the underlying type
+    /// * `body` - The enum body containing value definitions
+    ///
+    /// # Returns
+    /// A new `Enum` instance with parsed values
+    pub fn new(name: &str, size: u8, body: &str) -> Self {
         let mut values = Vec::new();
+        // Enum values increment from the prior value if not specified,
+        // with the default being 0
         let mut current_value = 0u64;
 
         for line in body.lines() {
+            // Each line has the form `VALUE,` or `VALUE=X,`
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -64,7 +82,7 @@ impl<'a> Enum {
             let line = line.trim_end_matches(',');
 
             if let Some(eq_pos) = line.find('=') {
-                // Parse explicit assignment like "GGGZERO=1"
+                // Parse explicit assignment like "VALUE=1"
                 let name = line[..eq_pos].trim().to_string();
                 let value_str = line[eq_pos + 1..].trim();
 
@@ -72,7 +90,7 @@ impl<'a> Enum {
                 if let Ok(assigned_value) = value_str.parse::<u64>() {
                     current_value = assigned_value;
                 } else {
-                    // If we can't parse it, default to current_value
+                    // Default to current_value
                     dbg!(format!(
                         "Warning: Could not parse enum value '{value_str}', using {current_value}"
                     ));
@@ -94,6 +112,13 @@ impl<'a> Enum {
         }
     }
 
+    /// Defines the enum in Binary Ninja's type system
+    ///
+    /// # Arguments
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// `true` if the enum was successfully defined
     pub fn define(&self, bv: &BinaryView) -> bool {
         // Create an enumeration builder
         let mut builder = EnumerationBuilder::new();
@@ -103,21 +128,42 @@ impl<'a> Enum {
             builder.insert(name, *value);
         }
 
-        // Finalize the enumeration
         let enumeration = builder.finalize();
 
-        // Create the enum type with the specified width
+        // Create the enum type with the specified width, default to 4 bytes
         let width = std::num::NonZeroUsize::new(self.size as usize)
             .unwrap_or_else(|| std::num::NonZeroUsize::new(4).unwrap());
         let enum_type = Type::enumeration(&enumeration, width, false);
-
-        // Define the type in Binary Ninja
         bv.define_user_type(&self.name, &enum_type);
         true
     }
 }
 
+/// Represents a C++ template definition with type parameters
+///
+/// This structure stores the template name, parameter names, and body content
+/// to support template instantiation with concrete types.
+#[derive(Debug, Clone)]
+pub struct Template {
+    /// The name of the template (e.g., "vector" for std::vector)
+    name: String,
+    /// List of template parameter names (e.g., ["T", "Allocator"])
+    typenames: Vec<String>,
+    /// The template body containing member definitions
+    body: String,
+}
+
 impl<'a> Template {
+    /// Creates a new template from its definition
+    ///
+    /// # Arguments
+    /// * `def` - The template declaration line, like `template template_name`
+    /// or simply `template_name`
+    /// * `body` - The template body containing member definitions
+    /// * `typenames` - List of template parameter names parsed from the definition line
+    ///
+    /// # Returns
+    /// A new `Template` instance
     pub fn new(def: &str, body: &str, typenames: Vec<String>) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse name from {def}"));
         Self {
@@ -126,6 +172,16 @@ impl<'a> Template {
             body: body.to_string(),
         }
     }
+
+    /// Instantiates the template with concrete types in Binary Ninja
+    ///
+    /// # Arguments
+    /// * `typenames` - Concrete type names to substitute for template parameters,
+    /// ordered according to the required substitution order in `self.typenames`
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Panics
+    /// Panics if the number of provided type names doest not match template parameters
     pub fn define<'b>(&self, typenames: Vec<String>, bv: &'a BinaryView) {
         assert_eq!(
             typenames.len(),
@@ -137,7 +193,9 @@ impl<'a> Template {
             if member.trim() == "" {
                 continue;
             }
-            println!("Member {member}");
+            dbg!(&format!("Member {member}"));
+            // Create a new member and provide the typenames to swap in case
+            // the given member uses a typename
             members.push(Member::new(
                 member,
                 bv,
@@ -145,6 +203,9 @@ impl<'a> Template {
                 Some(&typenames),
             ));
         }
+        // `self.name` is simply the name of the templated structure. Add
+        // `<typename1, typename2, ...>` to distinguish this particular
+        // instantiation.
         let mut name = self.name.clone();
         name.push('<');
         name.push_str(&typenames.join(", "));
@@ -153,18 +214,36 @@ impl<'a> Template {
     }
 }
 
+/// Represents a C++ struct with members and Binary Ninja type information
+///
+/// This structure stores the struct name, member definitions, and offset information
+/// to support Binary Ninja struct type creation.
 #[derive(Debug)]
 pub struct Structure {
+    /// The name of the struct
     name: String,
+    /// List of struct members
     members: Vec<Member>,
+    /// Base offset for the struct
     offset: u16,
 }
 
 impl<'a> Structure {
+    /// Creates a new structure from its definition
+    ///
+    /// # Arguments
+    /// * `def` - The struct declaration line, like `struct struct_name`
+    /// or simply `struct_name`
+    /// * `body` - The struct body containing member definitions
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// A new `Structure` instance
     pub fn new<'b>(def: &str, body: &str, bv: &'a BinaryView) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse definition {def} for name"));
         let mut members = vec![];
         for member in body.lines() {
+            // Create a new member with no templated fields
             members.push(Member::new(member, bv, None, None));
         }
 
@@ -174,6 +253,18 @@ impl<'a> Structure {
             offset: 0,
         }
     }
+
+    /// Creates a new structure from pre-parsed members. Useful for coercing
+    /// other types into a `Structure` for easy definition, such as [`Class`]
+    /// and [`Template`].
+    ///
+    /// # Arguments
+    /// * `name` - The pre-parsed struct name
+    /// * `members` - Pre-parsed member list
+    /// * `offset` - Base offset for the struct
+    ///
+    /// # Returns
+    /// A new `Structure` instance
     pub fn new_from_members(name: String, members: Vec<Member>, offset: u16) -> Self {
         Self {
             name,
@@ -181,6 +272,16 @@ impl<'a> Structure {
             offset,
         }
     }
+
+    /// Defines the structure in Binary Ninja's type system
+    ///
+    /// # Arguments
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// `true` if the structure was successfully defined
+    /// TODO migrate definition
+    /// TODO warn and return false anything fails
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
         let mut builder = StructureBuilder::new();
         for m in self.members.iter_mut() {
@@ -190,6 +291,8 @@ impl<'a> Structure {
                     typ,
                     comments,
                 } => {
+                    // Simply append basic members
+                    dbg!(&format!("Adding member: {name}"));
                     builder.append(
                         typ.as_ref(),
                         &name.clone(),
@@ -198,7 +301,8 @@ impl<'a> Structure {
                     );
                 }
                 Member::Function { name, ret, args } => {
-                    println!("NAME: {name}");
+                    // Create a function type and pointer to that function
+                    dbg!(&format!("Adding function: {name}"));
                     let mut v = vec![];
                     for (arg_name, arg_type) in args {
                         v.push(FunctionParameter::new(
@@ -207,6 +311,9 @@ impl<'a> Structure {
                             None,
                         ));
                     }
+                    // Create function with return value, arguments, and `false`
+                    // indicating no variable arguments
+                    // TODO include variable arguments
                     let func = Type::function(ret.as_ref(), v, false);
                     let func = Type::pointer(
                         &bv.default_arch().expect("Could not find default arch"),
@@ -219,27 +326,45 @@ impl<'a> Structure {
                         MemberScope::NoScope,
                     );
                 }
-                _ => (),
             }
         }
         let s = Type::structure(&builder.finalize());
-        dbg!(format!("Defining {}", self.name));
+        dbg!(format!("Defining structure {}", self.name));
         bv.define_user_type(&self.name, &s);
         true
     }
 }
 
+/// Represents a C++ class with virtual table, members, and inheritance
+///
+/// This structure supports C++ class features including virtual methods,
+/// member variables, and inheritance from base classes.
 #[derive(Debug)]
 pub struct Class {
+    /// The name of the class
     name: String,
-    vtable_methods: Vec<(Member, Option<String>)>, // Store method and override info
-    member_variables: Vec<(Member, Option<String>)>, // Store member and override info
-    base_classes: Vec<String>,                     // Store base class names for now
+    /// Virtual table methods with optional override information
+    vtable_methods: Vec<(Member, Option<String>)>,
+    /// Member variables with optional override information
+    member_variables: Vec<(Member, Option<String>)>,
+    /// List of base class names for inheritance
+    base_classes: Vec<String>,
 }
 
 impl<'a> Class {
+    /// Creates a new class from its definition
+    ///
+    /// # Arguments
+    /// * `def` - The class declaration line with inheritance,
+    /// e.g. `class class_name : parent1, parent2`
+    /// * `body` - The class body containing method and member definitions
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// A new `Class` instance
     pub fn new(def: &str, body: &str, bv: &'a BinaryView) -> Self {
         // Parse class name and inheritance with regex
+        // TODO parse inherited classes differently, inherited classes could be templated
         let class_regex = Regex::new(r"class\s+(\w+)(?:\s*:\s*(.+))?").unwrap();
         let (name, base_classes) = if let Some(captures) = class_regex.captures(def) {
             let class_name = captures.get(1).unwrap().as_str().to_string();
@@ -258,7 +383,7 @@ impl<'a> Class {
             };
             (class_name, base_classes)
         } else {
-            // Fallback to existing parse_name logic
+            // Fallback to existing `parse_name` logic
             let name = parse_name(def).expect(&format!("Could not parse class name from {def}"));
             (name, Vec::new())
         };
@@ -271,6 +396,9 @@ impl<'a> Class {
         let mut member_variables = Vec::new();
         let mut in_vtable = true;
 
+        // Body contains a list of vtable methods (including any overrides) followed by a single
+        // line `// ; end vtable` denoting the end of the vtable and start of members (including
+        // overrides).
         for line in body.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -290,6 +418,7 @@ impl<'a> Class {
                 }
             } else {
                 // Parse member variable
+                // TODO include offset information in this
                 let override_regex = Regex::new(r"//\s*;\s*override\s+(.+?);").unwrap();
                 let override_info = if let Some(captures) = override_regex.captures(line) {
                     Some(captures.get(1).unwrap().as_str().to_string())
@@ -299,8 +428,7 @@ impl<'a> Class {
 
                 // Remove override comment from the line
                 let clean_line = override_regex.replace(line, "").trim().to_string();
-                let member = Member::new(&clean_line, bv, None, None);
-                member_variables.push((member, override_info));
+                member_variables.push((Member::new(&clean_line, bv, None, None), override_info));
             }
         }
 
@@ -312,12 +440,21 @@ impl<'a> Class {
         }
     }
 
+    /// Parses a virtual table method definition with offset and override information
+    ///
+    /// # Arguments
+    /// * `line` - The method definition line
+    /// * `bv` - Binary Ninja binary view reference
+    /// * `class_name` - The class name for this pointer injection
+    ///
+    /// # Returns
+    /// `Some((Member, Option<String>))` if parsing succeeds, `None` otherwise
     fn parse_vtable_method(
         line: &str,
         bv: &'a BinaryView,
         class_name: &str,
     ) -> Option<(Member, Option<String>)> {
-        // Parse offset comment with regex
+        // Parse offset comment (`// ; offset=XX`) for `*this` with regex
         let offset_regex = Regex::new(r"//\s*;\s*offset=(-?\d+)").unwrap();
         let this_offset = if let Some(captures) = offset_regex.captures(line) {
             let offset_str = captures.get(1).unwrap().as_str();
@@ -327,10 +464,10 @@ impl<'a> Class {
                 offset_str.parse::<usize>().ok()
             }
         } else {
-            Some(0) // Default: this is at position 0
+            Some(0) // Default: `*this` is at position 0
         };
 
-        // Parse override comment with regex
+        // Parse override comment (`// ; override ret function_name(args, ...);`) with regex
         let override_regex = Regex::new(r"//\s*;\s*override\s+(.+?);").unwrap();
         let override_info = if let Some(captures) = override_regex.captures(line) {
             Some(captures.get(1).unwrap().as_str().to_string())
@@ -351,6 +488,17 @@ impl<'a> Class {
         }
     }
 
+    /// Parses a method signature (stripped of any comments)
+    /// and injects `*this` at specified offset
+    ///
+    /// # Arguments
+    /// * `line` - The method signature line
+    /// * `bv` - Binary Ninja binary view reference
+    /// * `this_offset` - Optional offset for `*this` injection
+    /// * `class_name` - The class name for `*this` type
+    ///
+    /// # Returns
+    /// `Some(Member)` if parsing succeeds, `None` otherwise
     fn parse_method_signature(
         line: &str,
         bv: &'a BinaryView,
@@ -364,6 +512,7 @@ impl<'a> Class {
 
         // Check for destructor: ~ClassName()
         if line.starts_with('~') && line.contains(&format!("~{class_name}")) {
+            // TODO assumption that there are no more args to a destructor
             let method_signature = if this_offset.is_some() {
                 format!("void (*~{class_name})({this_param});")
             } else {
@@ -411,7 +560,7 @@ impl<'a> Class {
             }
         }
 
-        // For regular methods, inject this pointer at the specified offset
+        // For regular methods, inject `*this` pointer at the specified offset
         if let Some(paren_pos) = line.find('(') {
             let before_paren = &line[..paren_pos];
             let params_str = &line[paren_pos + 1..line.rfind(')').unwrap_or(line.len())];
@@ -440,6 +589,7 @@ impl<'a> Class {
             }
 
             // Extract method name from before_paren
+            // TODO return type could contain a templated type with whitespace
             let parts: Vec<&str> = before_paren.trim().split_whitespace().collect();
             let (return_type, method_name) = if parts.len() >= 2 {
                 (parts[..parts.len() - 1].join(" "), parts[parts.len() - 1])
@@ -459,6 +609,14 @@ impl<'a> Class {
         }
     }
 
+    /// Processes virtual table methods for a specific base class
+    ///
+    /// # Arguments
+    /// * `vtable_methods` - List of virtual table methods
+    /// * `vtable_builder` - Structure builder for the virtual table
+    /// * `base_class` - The base class name
+    /// * `process_non_overriding` - Whether to process non-overriding methods
+    /// * `bv` - Binary Ninja binary view reference
     fn process_vtable_methods_for_base(
         vtable_methods: &[(Member, Option<String>)],
         vtable_builder: &mut StructureBuilder,
@@ -467,6 +625,7 @@ impl<'a> Class {
         bv: &'a BinaryView,
     ) {
         for (method, override_info) in vtable_methods {
+            // TODO move this to Member::define
             if let Member::Function { name, ret, args } = method {
                 let mut params = vec![];
                 for (arg_name, arg_type) in args {
@@ -484,9 +643,9 @@ impl<'a> Class {
 
                 if let Some(override_str) = override_info {
                     // Check if this override targets the current base class
-                    println!("OVERRIDE STR {override_str}");
+                    dbg!(&format!("Handling override: {override_str}"));
+                    // TODO what about multiple levels of inheritance?
                     if Self::is_override_for_base_class(override_str, base_class) {
-                        println!("FINDING OFFSET IN THIS CURRENT CLASS {base_class}");
                         // Parse the override information to find the target method
                         if let Some(offset) =
                             Self::parse_override_offset(override_str, base_class, bv)
@@ -515,18 +674,37 @@ impl<'a> Class {
         }
     }
 
+    /// Checks if an override string targets a specific base class
+    ///
+    /// # Arguments
+    /// * `override_str` - The override specification string, like
+    /// `void (* base_vtable::fn)(struct base* this);`
+    /// * `base_class` - The base class name to check
+    ///
+    /// # Returns
+    /// `true` if the override targets the base class
+    /// TODO what about multiple levels of inheritance
     fn is_override_for_base_class(override_str: &str, base_class: &str) -> bool {
         // Check if the override string contains the base class vtable name
         let base_vtable_name = format!("{}_vtable", base_class);
         override_str.contains(&base_vtable_name)
     }
 
+    /// Parses the offset for a method override in a base class virtual table
+    ///
+    /// # Arguments
+    /// * `override_str` - The override specification string
+    /// * `base_class` - The base class name
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// `Some(u64)` with the offset if found, `None` otherwise
     fn parse_override_offset(
         override_str: &str,
         base_class: &str,
         bv: &'a BinaryView,
     ) -> Option<u64> {
-        // Parse override string like "void (* HHH_vtable::HHH)(struct HHH* this)"
+        // Parse override string like `void (* base_vtable::fn)(struct base* this);`
         // Look for the base class vtable and method name
         let base_vtable_name = format!("{}_vtable", base_class);
 
@@ -535,26 +713,26 @@ impl<'a> Class {
             if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
                 // Get the structure members to find the method offset
                 if let Some(structure) = base_vtable_type.get_structure() {
-                    // Parse the method name from the override string
+                    // Parse the method name from the override string. `cleaned_override`
+                    // should look like `return_type (* fn)(args, ...)`
                     if let Some(cleaned_override) =
                         Self::extract_method_name_from_override(override_str)
                     {
                         // Find the method in the base vtable structure by reconstructing the signature
                         for (i, member) in structure.members().iter().enumerate() {
+                            // Get member type contents, which does not include the function name,
+                            // just the return value, `(*)`, and arguments
                             let mut contents = member.ty.contents.to_string();
 
-                            // Find (*) and insert the member name after the *
+                            // Find `(*)` and insert the member name after the `*`
                             if let Some(star_pos) = contents.find("(*)") {
                                 contents.insert_str(star_pos + 2, &format!(" {}", member.name));
                             }
 
-                            println!(
-                                "Checking cleaned override '{}' against reconstructed '{}'",
-                                cleaned_override, contents
-                            );
-
                             if cleaned_override == contents {
-                                println!("GOT MATCH");
+                                dbg!(&format!(
+                                    "Found override for '{cleaned_override}' in {base_class}",
+                                ));
                                 // Return the offset in bytes (assuming pointer size)
                                 let pointer_size = bv
                                     .default_arch()
@@ -570,21 +748,49 @@ impl<'a> Class {
         None
     }
 
+    /// Extracts the method name from an override specification
+    ///
+    /// # Arguments
+    /// * `override_str` - The override specification string, like
+    /// `void (* base_vtable::fn)(struct base* this)`
+    ///
+    /// # Returns
+    /// `Some(String)` with the cleaned method name (e.g., `void (* fn)(struct base* this)`),
+    /// `None` if parsing fails
+    /// TODO what about mutli-level vtables
     fn extract_method_name_from_override(override_str: &str) -> Option<String> {
-        // Parse override string like "void (* HHH_vtable::HHH)(struct HHH* this)"
-        // Remove the inherited XXX_vtable:: prefix while keeping the rest
+        // Parse override string like `void (* base_vtable::fn)(struct base* this);`
+        // Remove the inherited `base_vtable::` prefix while keeping the rest
         let regex = Regex::new(r"\w+_vtable::").unwrap();
         let cleaned = regex.replace_all(override_str, "");
         Some(cleaned.to_string())
     }
 
+    /// Extracts the member name from an override specification for a base class
+    ///
+    /// # Arguments
+    /// * `override_str` - The override specification string, like
+    /// `bool base_class::val1;`
+    /// * `base_class` - The base class name
+    ///
+    /// # Returns
+    /// `Some(String)` with the cleaned member name (e.g., `type_name member_name`)
     fn extract_member_from_override(override_str: &str, base_class: &str) -> Option<String> {
-        // For member overrides, remove the base_class:: prefix from anywhere in the string
+        // For member overrides, remove the `base_class::` prefix from anywhere in the string
         let prefix = format!("{}::", base_class);
         let cleaned = override_str.replace(&prefix, "");
         Some(cleaned)
     }
 
+    /// Parses the offset for a member override in base classes
+    ///
+    /// # Arguments
+    /// * `override_str` - The override specification string
+    /// * `base_classes` - List of base class names
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// `Some((String, u64))` with base class name and offset if found
     fn parse_member_override_offset(
         override_str: &str,
         base_classes: &[String],
@@ -595,27 +801,32 @@ impl<'a> Class {
             if let Some(cleaned_override) =
                 Self::extract_member_from_override(override_str, base_class)
             {
+                // `cleaned_override` should be `type_name member_name`
                 if let Some(base_type_id) = bv.type_id_by_name(base_class) {
                     if let Some(base_type) = bv.type_by_id(&base_type_id) {
                         if let Some(structure) = base_type.get_structure() {
                             // Find the member in the base class structure
                             for member in structure.members() {
+                                // Get type contents
                                 let mut member_type_contents = member.ty.contents.to_string();
+                                // Check to see if this is a function member
                                 let check_against =
                                     if let Some(star_pos) = member_type_contents.find("(*)") {
+                                        // `member_type_contents` contains the return value, `(*)`,
+                                        // and the arguments. Does not contain the function name, so
+                                        // insert it
                                         member_type_contents
                                             .insert_str(star_pos + 2, &format!(" {}", member.name));
                                         member_type_contents
                                     } else {
+                                        // Basic member type
                                         format!("{member_type_contents} {}", member.name)
                                     };
 
-                                println!(
-                                    "Checking member override '{}' against base class '{}' member '{}' with type '{}'",
-                                    cleaned_override, base_class, member.name, check_against
-                                );
-
                                 if cleaned_override == check_against {
+                                    dbg!(&format!(
+                                        "Found member override '{cleaned_override}' in base class '{base_class}'",
+                                    ));
                                     return Some((base_class.clone(), member.offset));
                                 }
                             }
@@ -627,8 +838,15 @@ impl<'a> Class {
         None
     }
 
+    /// Defines the class and its virtual tables in Binary Ninja's type system
+    ///
+    /// # Arguments
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// `true` if the class was successfully defined
     pub fn define(&self, bv: &'a BinaryView) -> bool {
-        // Create vtables for each base class
+        // Create separate vtables for overriding each base class's
         let mut vtable_names = Vec::new();
 
         if self.base_classes.is_empty() {
@@ -636,8 +854,9 @@ impl<'a> Class {
             let vtable_name = format!("{}_vtable", self.name);
             let mut vtable_builder = StructureBuilder::new();
 
-            for (method, _override_info) in &self.vtable_methods {
+            for (method, _) in &self.vtable_methods {
                 if let Member::Function { name, ret, args } = method {
+                    // TODO migrate this logic to Member::define
                     let mut params = vec![];
                     for (arg_name, arg_type) in args {
                         params.push(FunctionParameter::new(
@@ -680,11 +899,14 @@ impl<'a> Class {
                         &base_vtable_name,
                     );
 
-                    // Get the width of the base vtable
+                    // Get the width of the base vtable. This works with `NamedTypedReference`
+                    // because the underlying type is a pointer. BEWARE, this does not work
+                    // if it was a defined structure.
                     if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
                         base_vtable_width = base_vtable_type.width();
                     }
 
+                    // Set the base structure in the new vtable
                     let base_struct = BaseStructure::new(base_vtable_ref, 0, base_vtable_width);
                     vtable_builder.base_structures(&[base_struct]);
 
@@ -692,7 +914,8 @@ impl<'a> Class {
                     vtable_builder.width(base_vtable_width);
                 }
 
-                // Process vtable methods for this base class
+                // Process vtable methods for this base class. Handles overrides and adding
+                // the class-specific methods to the vtable if this is the first base class
                 Self::process_vtable_methods_for_base(
                     &self.vtable_methods,
                     &mut vtable_builder,
@@ -765,7 +988,7 @@ impl<'a> Class {
                         vtable_ptr.as_ref(),
                         &vtable_member_name,
                         current_offset,
-                        true,
+                        true, // overwrite existing
                         MemberAccess::PublicAccess,
                         MemberScope::NoScope,
                     );
@@ -792,7 +1015,7 @@ impl<'a> Class {
                     vtable_ptr.as_ref(),
                     "vtable",
                     0,
-                    true,
+                    true, // overwrite existing
                     MemberAccess::PublicAccess,
                     MemberScope::NoScope,
                 );
@@ -800,7 +1023,6 @@ impl<'a> Class {
         }
 
         // Step 3: Handle member variable overrides and add member variables specific to this class
-        let mut cumulative_base_offset = 0u64;
         for (member, override_info) in &self.member_variables {
             if let Some(override_str) = override_info {
                 // This member overrides a base class member
@@ -809,7 +1031,7 @@ impl<'a> Class {
                 {
                     // Calculate the actual offset by adding the base class offset
                     let mut actual_offset = base_offset;
-                    for (i, base) in self.base_classes.iter().enumerate() {
+                    for base in self.base_classes.iter() {
                         if base == &base_class {
                             break;
                         }
@@ -822,6 +1044,7 @@ impl<'a> Class {
                     }
 
                     // Insert the overriding member at the calculated offset
+                    // TODO move this to Member::define
                     match member {
                         Member::Basic {
                             name,
@@ -867,6 +1090,7 @@ impl<'a> Class {
             }
 
             // No override, append normally
+            // TODO move this to Member::define
             match member {
                 Member::Basic {
                     name,
@@ -902,7 +1126,6 @@ impl<'a> Class {
                         MemberScope::NoScope,
                     );
                 }
-                _ => (),
             }
         }
 
@@ -914,28 +1137,44 @@ impl<'a> Class {
     }
 }
 
+/// Represents different types of C++ class/struct members
+///
+/// This enum covers basic data members, function pointers, and template members
+/// with their respective type information and comments.
 #[derive(Debug)]
 pub enum Member {
+    /// A basic data member with type and name
     Basic {
+        /// The member name
         name: String,
+        /// Binary Ninja type reference for the member
         typ: Ref<Type>,
+        /// Associated comments for the member
         comments: Vec<String>,
     },
+    /// A function pointer member with return type and arguments
     Function {
+        /// The function name
         name: String,
+        /// Binary Ninja type reference for the return type
         ret: Ref<Type>,
+        /// List of function arguments as (name, type) pairs
         args: Vec<(String, Ref<Type>)>,
-    },
-    Template {
-        name: String,
-        args: Vec<String>,
-        comments: Vec<String>,
     },
 }
 
 impl Member {
+    /// Defines a type with specified pointer depth in Binary Ninja
+    ///
+    /// # Arguments
+    /// * `t` - The type name
+    /// * `depth` - Number of pointer indirections
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// Binary Ninja type reference for the defined type
     fn define_type(t: &str, depth: u8, bv: &BinaryView) -> Ref<Type> {
-        println!("Defining type {t}");
+        dbg!(&format!("Defining type {t}"));
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
@@ -946,10 +1185,12 @@ impl Member {
                     &type_id,
                     t,
                 );
-                println!("Found named type {:?}", named_ref);
                 // Hack: `Type::named_type(&named_ref)` always returns
                 // a reference with width 0, making any member structs
-                // (that are not pointers to structs) appear with 0 size
+                // (that are not pointers to structs) appear with 0 size.
+                // Workaround using `Type::named_type_from_type` after
+                // fetching the type with `type_by_ref` using the reference
+                // above
                 Type::named_type_from_type(
                     named_ref.name(),
                     bv.type_by_ref(&named_ref)
@@ -957,6 +1198,7 @@ impl Member {
                         .as_ref(),
                 )
             } else {
+                // TODO consider returning option and warn
                 panic!("Could not find type: {}", t);
             }
         };
@@ -968,15 +1210,28 @@ impl Member {
         }
         typ
     }
+
+    /// Creates a new member from its definition string
+    ///
+    /// # Arguments
+    /// * `def` - The member definition string, e.g., `type_name** type`
+    /// * `bv` - Binary Ninja binary view reference
+    /// * `template_members` - Optional template parameter names
+    /// * `template_defs` - Optional template parameter definitions
+    ///
+    /// # Returns
+    /// A new `Member` instance
     fn new(
         def: &str,
         bv: &BinaryView,
         template_members: Option<&Vec<String>>,
         template_defs: Option<&Vec<String>>,
     ) -> Self {
-        let (mut typ, name, depth) =
+        let (typ, name, depth) =
             parse_member_definition(def).expect("Could not parse member definition");
-        dbg!(format!("GOT MEMBER DEFINITION {typ} {name} {depth}"));
+        dbg!(format!(
+            "Got member definition type={typ}, name={name}, depth={depth}"
+        ));
         if let Some(_) = is_primitive(&typ) {
             let typ = Self::define_type(&typ, depth, bv);
             return Member::Basic {
@@ -990,7 +1245,6 @@ impl Member {
             if let Some(t_members) = template_members {
                 let t_defs = template_defs.unwrap();
                 let mut tokens = parse_template_member_definition(&def);
-                println!("{tokens:?}");
 
                 // Replace template parameters with their concrete types
                 for token in &mut tokens {
@@ -1001,9 +1255,9 @@ impl Member {
 
                 // Reconstruct the type string with substituted parameters
                 def = tokens.join("");
-                println!("Substituted type: {def}");
+                dbg!(&format!("Instantitated templated type {def}"));
             }
-            // Try to match function definition: return_type (*name)(args)
+            // Try to match function definition: `return_type (*name)(args)`
             let func_regex = Regex::new(r"(.*) \(\*(.*)\)\((.*)\)").unwrap();
             if let Some(captures) = func_regex.captures(&def) {
                 let return_type = captures.get(1).unwrap().as_str().trim();
@@ -1011,16 +1265,14 @@ impl Member {
                 let args = captures.get(3).unwrap().as_str().trim();
 
                 dbg!(format!(
-                    "GOT FUNCTION DEFINITION: return_type={}, name={}, args={:#}",
+                    "Got function definition: return_type={}, name={}, args={:#}",
                     return_type, name, args
                 ));
                 let (return_type, _, depth) = parse_member_definition(return_type)
                     .expect("Could not parse function member return type");
-                println!("{return_type} {depth}");
                 let args = parse_template_instantiation(args)
                     .expect("Could not parse function member args");
                 let mut defined_args = vec![];
-                println!("args={:?}", args);
                 for a in args {
                     let (typ, name, depth) = parse_member_definition(&a)
                         .expect("Could not parse argument to function definition");
@@ -1033,6 +1285,7 @@ impl Member {
                     args: defined_args,
                 };
             } else {
+                // Not a function definition
                 let (typ, name, depth) =
                     parse_member_definition(&def).expect(&format!("Could not parse {def}"));
                 let typ = Self::define_type(&typ, depth, bv);
@@ -1046,6 +1299,14 @@ impl Member {
     }
 }
 
+/// Parses a template member definition into individual tokens
+///
+/// # Arguments
+/// * `s` - The template member definition string, like
+/// `struct_name<type1, type2>** member_name`
+///
+/// # Returns
+/// Vector of tokens from the definition
 fn parse_template_member_definition(s: &str) -> Vec<String> {
     let mut curr = String::new();
     let mut typenames = Vec::<String>::new();
@@ -1070,8 +1331,16 @@ fn parse_template_member_definition(s: &str) -> Vec<String> {
     typenames
 }
 
-// Parses template instantiation `temp<type1, type2<type3, type4>>`, etc. The input
-// should be the text within the opening `<` and closing `>`.
+/// Parses template instantiation like `temp<type1, type2<type3, type4>>`
+///
+/// The input should be the text within the opening `<` and closing `>`.
+/// Handles nested template arguments with proper bracket matching.
+///
+/// # Arguments
+/// * `s` - The template instantiation string (contents between angle brackets)
+///
+/// # Returns
+/// `Some(Vec<String>)` with parsed type arguments, `None` if parsing fails
 fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
     let mut curr = String::new();
     let mut typenames = Vec::<String>::new();
@@ -1124,9 +1393,17 @@ fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
     Some(typenames)
 }
 
-/// Parses for templated typenames declared between `< ... >`. Input `s` should be
-/// the contents between the angle brackets, where each templated name is separated by
-/// a comma.
+/// Parses template parameter names from template definition
+///
+/// Extracts template parameter names from the contents between angle brackets.
+/// Filters out keywords like 'typename' and 'class'.
+///
+/// # Arguments
+/// * `s` - The template definition string (contents between angle brackets), like
+/// `typename1, struct_two<typename2, typename3>`.
+///
+/// # Returns
+/// `Some(Vec<String>)` with template parameter names, `None` if parsing fails
 fn parse_template_definition(s: &str) -> Option<Vec<String>> {
     let mut curr = String::new();
     let mut typenames = Vec::<String>::new();
@@ -1149,16 +1426,19 @@ fn parse_template_definition(s: &str) -> Option<Vec<String>> {
         typenames.push(curr);
     }
 
-    // find closing '>', so the remaining string should appear <class|struct|etc> <name>
-    // let rest = &rest[rest.find('>')? + 1..].trim();
-    // let rest = &rest[rest.find(' ')? + 1..].trim();
-    // rest should now be just the name
     Some(typenames)
 }
 
-/// Parses a class, struct, or enum definition where the string `def` is formatted
-/// like <type> <name>. This should be a forward declaration or a structure definition
-/// preceding the opening brace.
+/// Parses the name from a class, struct, template, or enum definition
+///
+/// Extracts the type name from definitions like "struct MyStruct" or "class MyClass"
+/// by stripping the preceding type identifier.
+///
+/// # Arguments
+/// * `def` - The definition string, e.g., `struct MyStruct`
+///
+/// # Returns
+/// `Some(String)` with the parsed name, `None` if parsing fails
 fn parse_name(def: &str) -> Option<String> {
     let mut s = def.trim();
     if s.starts_with("struct ") {
@@ -1167,10 +1447,19 @@ fn parse_name(def: &str) -> Option<String> {
         s = s.strip_prefix("class ")?;
     } else if s.starts_with("enum ") {
         s = s.strip_prefix("enum ")?;
+    } else if s.starts_with("template ") {
+        s.strip_prefix("template ")?;
     }
     Some(s.to_string())
 }
 
+/// Determines the pointer depth and extracts the suffix from a type definition
+///
+/// # Arguments
+/// * `def` - The type definition string
+///
+/// # Returns
+/// A tuple of (pointer_depth, remaining_suffix)
 fn get_pointer_depth(def: &str) -> (u8, String) {
     let mut depth = 0u8;
     let mut suffix = String::new();
@@ -1187,6 +1476,13 @@ fn get_pointer_depth(def: &str) -> (u8, String) {
     (depth, suffix)
 }
 
+/// Parses a member definition into type, name, and pointer depth
+///
+/// # Arguments
+/// * `def` - The member definition string
+///
+/// # Returns
+/// `Some((type, name, pointer_depth))` if parsing succeeds, `None` otherwise
 fn parse_member_definition(def: &str) -> Option<(String, String, u8)> {
     let mut def = def.trim();
     if let Some(trimmed) = def.strip_suffix(";") {
@@ -1203,9 +1499,16 @@ fn parse_member_definition(def: &str) -> Option<(String, String, u8)> {
     Some((def.to_string(), name, depth))
 }
 
-/// Parses the name from a member definition, such as `struct B* C`. Assumes that
-/// the delineating characters between the name and the type are any combination of
-/// `*` and ` `. Assumes there is no trailing `;`.
+/// Parses the member name from a member definition
+///
+/// Extracts the member name from definitions like `struct B* C`.
+/// Assumes delineating characters between name and type are `*` and ` `.
+///
+/// # Arguments
+/// * `s` - The member definition string
+///
+/// # Returns
+/// `Some(String)` with the member name, `None` if parsing fails
 fn parse_member_name(s: &str) -> Option<String> {
     for (i, c) in s.chars().rev().enumerate() {
         match c {
@@ -1218,6 +1521,13 @@ fn parse_member_name(s: &str) -> Option<String> {
     None
 }
 
+/// Finds the next significant token in a C++ definition string
+///
+/// # Arguments
+/// * `s` - The string to search
+///
+/// # Returns
+/// `Some((index, character, prefix))` if a token is found, `None` otherwise
 fn find_next_token(s: &str) -> Option<(usize, char, &str)> {
     for (i, c) in s.char_indices() {
         if c == '{' || c == ';' || c == '<' || c == '"' {
@@ -1227,6 +1537,14 @@ fn find_next_token(s: &str) -> Option<(usize, char, &str)> {
     None
 }
 
+/// Finds the closing token that matches the given opening token
+///
+/// # Arguments
+/// * `s` - The string to search
+/// * `token` - The opening token character
+///
+/// # Returns
+/// `Some((index, closing_char, prefix))` if a closing token is found, `None` otherwise
 fn find_closing_token(s: &str, token: char) -> Option<(usize, char, &str)> {
     let mut j = s.len() - 1;
     let mut ch = 'X';
@@ -1248,24 +1566,34 @@ fn find_closing_token(s: &str, token: char) -> Option<(usize, char, &str)> {
     }
 }
 
+/// Main parser for C++ header files
+///
+/// This parser processes C++ header content and creates corresponding
+/// Binary Ninja types including structs, classes, templates, and enums.
 pub struct Parser<'a> {
+    /// Binary Ninja binary view reference
     bv: &'a BinaryView,
-    arch: CoreArchitecture,
-    // templates,
-    // classes
-    // structs
 }
 
 impl<'a> Parser<'a> {
     /// Creates a new Parser instance with the provided BinaryView
+    ///
+    /// # Arguments
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// A new `Parser` instance
     pub fn new(bv: &'a BinaryView) -> Self {
-        let arch = bv
-            .default_arch()
-            .expect("Could not get default architecture");
-        Self { bv, arch }
+        Self { bv }
     }
 
     /// Parses C++ header content and imports types into Binary Ninja
+    ///
+    /// Processes the header content to extract and define structs, classes,
+    /// templates, and enums in Binary Ninja's type system.
+    ///
+    /// # Arguments
+    /// * `contents` - The C++ header file content as a string
     pub fn parse(self, contents: &str) {
         let mut templates = Vec::<Template>::new();
         let mut idx = 0usize;
@@ -1423,9 +1751,17 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Binary Ninja command for importing C++ types from test.hpp
+///
+/// This command provides a user interface for triggering the C++ type import
+/// functionality within Binary Ninja.
 struct ImportCppTypesCommand;
 
 impl Command for ImportCppTypesCommand {
+    /// Executes the C++ type import command
+    ///
+    /// # Arguments
+    /// * `view` - Binary Ninja binary view reference
     fn action(&self, view: &BinaryView) {
         info!("Importing C++ types from test.hpp");
 
@@ -1455,12 +1791,26 @@ impl Command for ImportCppTypesCommand {
         }
     }
 
+    /// Determines if the command is valid for the current context
+    ///
+    /// # Arguments
+    /// * `_view` - Binary Ninja binary view reference (unused)
+    ///
+    /// # Returns
+    /// Always returns `true` as the command is always valid
     fn valid(&self, _view: &BinaryView) -> bool {
         // Command is always valid
         true
     }
 }
 
+/// Binary Ninja plugin initialization function
+///
+/// This function is called when the plugin is loaded by Binary Ninja.
+/// It sets up logging and registers the C++ type import command.
+///
+/// # Returns
+/// `true` if initialization succeeds, `false` otherwise
 #[allow(non_snake_case)]
 #[no_mangle]
 pub extern "C" fn CorePluginInit() -> bool {
@@ -1481,11 +1831,9 @@ pub extern "C" fn CorePluginInit() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use binaryninja::binary_view::{BinaryView, BinaryViewBase, BinaryViewExt};
     use binaryninja::headless::Session;
-    use binaryninja::rc::Ref;
     use std::fs::File;
-    use std::io::{self, Read};
+    use std::io::Read;
     use std::path::PathBuf;
 
     // fn get_binary_view() -> Ref<BinaryView> {
@@ -1496,11 +1844,10 @@ mod tests {
     // bv
     // }
 
-    use crate::{find_next_token, parse_template_definition, Parser};
+    use crate::{parse_template_definition, Parser};
 
     #[test]
     fn test_parsing() {
-        use binaryninja::binary_view::{BinaryView, BinaryViewBase, BinaryViewExt};
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut save_path = path.clone();
         path.push("../test.hpp");
@@ -1514,14 +1861,7 @@ mod tests {
         file.read_to_string(&mut contents)
             .expect("Could not read file contents");
         println!("File contents:\n{}", contents);
-        let p = Parser {
-            arch: bv
-                .as_ref()
-                .default_arch()
-                .expect("Could not get default architecture")
-                .clone(),
-            bv: bv.as_ref(),
-        };
+        let p = Parser { bv: bv.as_ref() };
         p.parse(&contents);
         // println!("Tyring to save");
         // assert!(bv.save_to_path(&save_path));
