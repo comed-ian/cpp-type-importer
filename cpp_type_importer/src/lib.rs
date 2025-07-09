@@ -17,9 +17,8 @@ use std::path::PathBuf;
 // 1. Namespaces
 // 2. Packed
 // 3. Multi-level inheritance
-// 4. Typedefs
-// 5. Templated Typedefs
-// 6. Conflicting vtable function names (e.g., MyMethod)
+// 4. Templated Typedefs
+// 5. Conflicting vtable function names (e.g., MyMethod)
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -142,6 +141,39 @@ impl<'a> Enum {
             .unwrap_or_else(|| std::num::NonZeroUsize::new(4).unwrap());
         let enum_type = Type::enumeration(&enumeration, width, false);
         bv.define_user_type(&self.name, &enum_type);
+        true
+    }
+}
+
+/// Represents a C++ typedef definition.
+///
+/// This can be either a basic structure or a templated structure. Because
+/// Binary Ninja's API does not expose a `Type::typedef`, use the
+/// `TypeParser` to parse a literal string.
+#[derive(Debug)]
+pub struct Typedef {
+    name: String,
+    typ: String,
+    depth: u8,
+}
+
+impl<'a> Typedef {
+    pub fn new(def: &str) -> Self {
+        let (typ, name, depth) =
+            parse_member_definition(def).expect("Could not parse typedef definition");
+        Self { name, typ, depth }
+    }
+
+    pub fn define(&self, bv: &'a BinaryView) -> bool {
+        let target_type = if let Some(tt) = is_primitive(&self.typ) {
+            tt
+        } else {
+            Member::define_type(&self.typ, self.depth, bv)
+            // println!("{t:?}");
+            // Type::named_type_from_type(&self.typ, t.as_ref())
+        };
+        println!("{:?}", target_type);
+        bv.define_user_type(&self.name, &target_type);
         true
     }
 }
@@ -1561,36 +1593,50 @@ impl<'a> Parser<'a> {
                             templates.push(t);
                             idx += i2 + 1;
                         } else {
-                            // s looks like `structname<`. Find closing `;` to get the contents
-                            // within the angled brackets.
+                            // s looks like `struct_name<` or `typedef struct_name<`.
+                            // Find closing `;` to get the contents within the angled brackets.
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], ';')
                                 .expect("Could not find closing token for template instantiation");
-                            println!("{s} {s2}");
-                            if let Some(stripped) = s2.strip_suffix('>') {
-                                s2 = stripped;
+                            if s.starts_with("typedef ") {
+                                let mut typedef_string = s[8..].to_string();
+                                typedef_string.push('<');
+                                typedef_string.push_str(&s2);
+                                println!("Got typedef string: {typedef_string}");
+                                let t = Typedef::new(&typedef_string);
+                                t.define(self.bv);
+                            } else {
+                                println!("{s} {s2}");
+                                if let Some(stripped) = s2.strip_suffix('>') {
+                                    s2 = stripped;
+                                }
+                                dbg!(format!("Got template instantiation {s2}"));
+                                let typenames = parse_template_instantiation(s2)
+                                    .expect(&format!("Could not parse template definitions {s2}"));
+                                dbg!(format!("{typenames:?}"));
+                                // check for template named `s` to declare
+                                let t = templates
+                                    .iter()
+                                    .find(|x| &x.name == s.trim())
+                                    .expect(&format!("Could not find template {s} for definition"));
+                                t.define(typenames, self.bv);
                             }
-                            dbg!(format!("Got template instantiation {s2}"));
-                            let typenames = parse_template_instantiation(s2)
-                                .expect(&format!("Could not parse template definitions {s2}"));
-                            dbg!(format!("{typenames:?}"));
-                            // check for template named `s` to declare
-                            let t = templates
-                                .iter()
-                                .find(|x| &x.name == s.trim())
-                                .expect(&format!("Could not find template {s} for definition"));
-                            t.define(typenames, self.bv);
-                            println!("{idx}");
                             idx += i2 + 1;
-                            println!("{idx}");
                         }
                     }
                     ';' => {
-                        // forward declaration
-                        let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
-                            .expect("Could not find closing token");
-                        s2 = s2.trim();
-                        dbg!(format!("Got forward declaration {s2}"));
-                        idx += i2 + 1;
+                        if s.starts_with("typedef ") {
+                            // typedef like `typedef struct_1 struct_2;`. Templated types
+                            // match to `<` and are handled above.
+                            let t = Typedef::new(&s[8..]);
+                            t.define(self.bv);
+                        } else {
+                            // forward declaration
+                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                                .expect("Could not find closing token");
+                            s2 = s2.trim();
+                            dbg!(format!("Got forward declaration {s2}"));
+                            idx += i2 + 1;
+                        }
                     }
                     '{' => {
                         // class or struct definition

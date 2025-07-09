@@ -100,3 +100,7 @@ class MMM : HHH, III, LLL {
   bool arg2; // ; override bool III::arg1;
   void** (*cb2)(); // ; override void* (* HHH::cb)();
 };
+
+typedef MMM NNN;
+
+typedef Abc<int32_t, bool>* OOO;
