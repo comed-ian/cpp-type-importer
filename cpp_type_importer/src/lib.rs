@@ -1,4 +1,3 @@
-use binaryninja::architecture::CoreArchitecture;
 use binaryninja::binary_view::BinaryViewExt;
 use binaryninja::command::{register_command, Command};
 // use binaryninja::logger::Logger;
@@ -13,6 +12,14 @@ use regex::Regex;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+
+// TODO
+// 1. Namespaces
+// 2. Packed
+// 3. Multi-level inheritance
+// 4. Typedefs
+// 5. Templated Typedefs
+// 6. Conflicting vtable function names (e.g., MyMethod)
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -285,48 +292,7 @@ impl<'a> Structure {
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
         let mut builder = StructureBuilder::new();
         for m in self.members.iter_mut() {
-            match m {
-                Member::Basic {
-                    name,
-                    typ,
-                    comments,
-                } => {
-                    // Simply append basic members
-                    dbg!(&format!("Adding member: {name}"));
-                    builder.append(
-                        typ.as_ref(),
-                        &name.clone(),
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
-                }
-                Member::Function { name, ret, args } => {
-                    // Create a function type and pointer to that function
-                    dbg!(&format!("Adding function: {name}"));
-                    let mut v = vec![];
-                    for (arg_name, arg_type) in args {
-                        v.push(FunctionParameter::new(
-                            arg_type.clone(),
-                            arg_name.clone(),
-                            None,
-                        ));
-                    }
-                    // Create function with return value, arguments, and `false`
-                    // indicating no variable arguments
-                    // TODO include variable arguments
-                    let func = Type::function(ret.as_ref(), v, false);
-                    let func = Type::pointer(
-                        &bv.default_arch().expect("Could not find default arch"),
-                        func.as_ref(),
-                    );
-                    builder.append(
-                        func.as_ref(),
-                        &name.clone(),
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
-                }
-            }
+            m.define(None, &mut builder, bv);
         }
         let s = Type::structure(&builder.finalize());
         dbg!(format!("Defining structure {}", self.name));
@@ -626,21 +592,7 @@ impl<'a> Class {
     ) {
         for (method, override_info) in vtable_methods {
             // TODO move this to Member::define
-            if let Member::Function { name, ret, args } = method {
-                let mut params = vec![];
-                for (arg_name, arg_type) in args {
-                    params.push(FunctionParameter::new(
-                        arg_type.clone(),
-                        arg_name.clone(),
-                        None,
-                    ));
-                }
-                let func = Type::function(ret.as_ref(), params, false);
-                let func_ptr = Type::pointer(
-                    &bv.default_arch().expect("Could not find default arch"),
-                    func.as_ref(),
-                );
-
+            if let Member::Function { .. } = method {
                 if let Some(override_str) = override_info {
                     // Check if this override targets the current base class
                     dbg!(&format!("Handling override: {override_str}"));
@@ -651,24 +603,12 @@ impl<'a> Class {
                             Self::parse_override_offset(override_str, base_class, bv)
                         {
                             // Override at specific offset
-                            vtable_builder.insert(
-                                func_ptr.as_ref(),
-                                name,
-                                offset,
-                                true, // overwrite existing
-                                MemberAccess::PublicAccess,
-                                MemberScope::NoScope,
-                            );
+                            method.define(Some(offset), vtable_builder, bv);
                         }
                     }
                 } else if process_non_overriding {
                     // No override, add to vtable only if processing non-overriding methods
-                    vtable_builder.append(
-                        func_ptr.as_ref(),
-                        name,
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
+                    method.define(None, vtable_builder, bv);
                 }
             }
         }
@@ -855,27 +795,8 @@ impl<'a> Class {
             let mut vtable_builder = StructureBuilder::new();
 
             for (method, _) in &self.vtable_methods {
-                if let Member::Function { name, ret, args } = method {
-                    // TODO migrate this logic to Member::define
-                    let mut params = vec![];
-                    for (arg_name, arg_type) in args {
-                        params.push(FunctionParameter::new(
-                            arg_type.clone(),
-                            arg_name.clone(),
-                            None,
-                        ));
-                    }
-                    let func = Type::function(ret.as_ref(), params, false);
-                    let func_ptr = Type::pointer(
-                        &bv.default_arch().expect("Could not find default arch"),
-                        func.as_ref(),
-                    );
-                    vtable_builder.append(
-                        func_ptr.as_ref(),
-                        name,
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
+                if let Member::Function { .. } = method {
+                    method.define(None, &mut vtable_builder, bv);
                 }
             }
 
@@ -1044,89 +965,13 @@ impl<'a> Class {
                     }
 
                     // Insert the overriding member at the calculated offset
-                    // TODO move this to Member::define
-                    match member {
-                        Member::Basic {
-                            name,
-                            typ,
-                            comments: _,
-                        } => {
-                            class_builder.insert(
-                                typ.as_ref(),
-                                name,
-                                actual_offset,
-                                true, // overwrite existing
-                                MemberAccess::PublicAccess,
-                                MemberScope::NoScope,
-                            );
-                        }
-                        Member::Function { name, ret, args } => {
-                            let mut params = vec![];
-                            for (arg_name, arg_type) in args {
-                                params.push(FunctionParameter::new(
-                                    arg_type.clone(),
-                                    arg_name.clone(),
-                                    None,
-                                ));
-                            }
-                            let func = Type::function(ret.as_ref(), params, false);
-                            let func_ptr = Type::pointer(
-                                &bv.default_arch().expect("Could not find default arch"),
-                                func.as_ref(),
-                            );
-                            class_builder.insert(
-                                func_ptr.as_ref(),
-                                name,
-                                actual_offset,
-                                true, // overwrite existing
-                                MemberAccess::PublicAccess,
-                                MemberScope::NoScope,
-                            );
-                        }
-                        _ => (),
-                    }
+                    member.define(Some(actual_offset), &mut class_builder, bv);
                     continue;
                 }
             }
 
             // No override, append normally
-            // TODO move this to Member::define
-            match member {
-                Member::Basic {
-                    name,
-                    typ,
-                    comments: _,
-                } => {
-                    class_builder.append(
-                        typ.as_ref(),
-                        name,
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
-                }
-                Member::Function { name, ret, args } => {
-                    // Handle function pointers in member variables
-                    let mut params = vec![];
-                    for (arg_name, arg_type) in args {
-                        params.push(FunctionParameter::new(
-                            arg_type.clone(),
-                            arg_name.clone(),
-                            None,
-                        ));
-                    }
-                    let func = Type::function(ret.as_ref(), params, false);
-                    let func_ptr = Type::pointer(
-                        &bv.default_arch().expect("Could not find default arch"),
-                        func.as_ref(),
-                    );
-                    class_builder.append(
-                        func_ptr.as_ref(),
-                        name,
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
-                }
-            }
+            member.define(None, &mut class_builder, bv);
         }
 
         // Define the class structure
@@ -1163,7 +1008,7 @@ pub enum Member {
     },
 }
 
-impl Member {
+impl<'a> Member {
     /// Defines a type with specified pointer depth in Binary Ninja
     ///
     /// # Arguments
@@ -1294,6 +1139,77 @@ impl Member {
                     typ,
                     comments: vec![],
                 };
+            }
+        }
+    }
+    pub fn define<'b>(
+        &self,
+        offset: Option<u64>,
+        builder: &mut StructureBuilder,
+        bv: &'a BinaryView,
+    ) {
+        match self {
+            Member::Basic {
+                name,
+                typ,
+                comments,
+            } => {
+                // Simply append basic members
+                dbg!(&format!("Adding member: {name}"));
+                if let Some(o) = offset {
+                    builder.insert(
+                        typ.as_ref(),
+                        &name.clone(),
+                        o,
+                        true, // overwrite existing
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                } else {
+                    builder.append(
+                        typ.as_ref(),
+                        &name.clone(),
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+            }
+            Member::Function { name, ret, args } => {
+                // Create a function type and pointer to that function
+                dbg!(&format!("Adding function: {name}"));
+                let mut v = vec![];
+                for (arg_name, arg_type) in args {
+                    v.push(FunctionParameter::new(
+                        arg_type.clone(),
+                        arg_name.clone(),
+                        None,
+                    ));
+                }
+                // Create function with return value, arguments, and `false`
+                // indicating no variable arguments
+                // TODO include variable arguments
+                let func = Type::function(ret.as_ref(), v, false);
+                let func = Type::pointer(
+                    &bv.default_arch().expect("Could not find default arch"),
+                    func.as_ref(),
+                );
+                if let Some(o) = offset {
+                    builder.insert(
+                        func.as_ref(),
+                        &name.clone(),
+                        o,
+                        true, // overwrite existing
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                } else {
+                    builder.append(
+                        func.as_ref(),
+                        &name.clone(),
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
             }
         }
     }
@@ -1836,14 +1752,6 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
 
-    // fn get_binary_view() -> Ref<BinaryView> {
-
-    // println!("Filename:  `{}`", bv.file().filename());
-    // println!("File size: `{:#x}`", bv.len());
-    // println!("Function count: {}", bv.functions().len());
-    // bv
-    // }
-
     use crate::{parse_template_definition, Parser};
 
     #[test]
@@ -1863,8 +1771,6 @@ mod tests {
         println!("File contents:\n{}", contents);
         let p = Parser { bv: bv.as_ref() };
         p.parse(&contents);
-        // println!("Tyring to save");
-        // assert!(bv.save_to_path(&save_path));
     }
 
     #[test]

@@ -1,21 +1,21 @@
 #include <stdint.h>
 
-struct Zyx_abc {
+struct aaa {
   int32_t a;
   int64_t b;
   bool* c;
 };
 
-struct ddd {
-  void* (*f)(void*, int32_t);
-};
-
-struct aaa {
-  Zyx_abc innards;
+struct bbb {
+  aaa innards;
 };
 
 struct ccc {
-  Zyx_abc* a;
+  aaa* a;
+};
+
+struct ddd {
+  void* (*f)(void*, int32_t);
 };
 
 template <typename T, typename UV> struct Abc {
@@ -39,7 +39,7 @@ template <typename T> struct eee {
   void* (*fn)(T* clazz);
 };
 
-eee<Zyx_abc>;
+eee<aaa>;
 
 enum fff : uint8_t {
   ZERO,
@@ -48,9 +48,9 @@ enum fff : uint8_t {
 };
 
 enum ggg {
-  GGGZERO=1,
-  GGGONE,
-  GGGTWO
+  GGGONE=1,
+  GGGTWO,
+  GGGTHREE,
 };
 
 class HHH {
@@ -60,7 +60,7 @@ class HHH {
   bool myMethod(uint32_t*);
   // ; end vtable
   uint32_t a;
-  Zyx_abc* b;
+  aaa* b;
   void* (*cb)();
 };
 
