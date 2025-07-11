@@ -48,6 +48,15 @@ fn is_primitive(s: &str) -> Option<Ref<Type>> {
     }
 }
 
+pub fn get_type_width_by_name(name: &str, bv: &BinaryView) -> Option<u64> {
+    let id = bv.type_id_by_name(name)?;
+    // Get the width of the base vtable. This works with `NamedTypedReference`
+    // because the underlying type is a pointer. BEWARE, this does not work
+    // if it was a defined structure.
+    let typ = bv.type_by_id(&id)?;
+    Some(typ.width())
+}
+
 /// Represents a C++ enum with values and size specification
 ///
 /// This structure stores enum name, underlying type size, and value mappings
@@ -169,8 +178,6 @@ impl<'a> Typedef {
             tt
         } else {
             Member::define_type(&self.typ, self.depth, bv)
-            // println!("{t:?}");
-            // Type::named_type_from_type(&self.typ, t.as_ref())
         };
         println!("{:?}", target_type);
         bv.define_user_type(&self.name, &target_type);
@@ -852,11 +859,9 @@ impl<'a> Class {
                         &base_vtable_name,
                     );
 
-                    // Get the width of the base vtable. This works with `NamedTypedReference`
-                    // because the underlying type is a pointer. BEWARE, this does not work
-                    // if it was a defined structure.
-                    if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
-                        base_vtable_width = base_vtable_type.width();
+                    // Get the width of the base vtable.
+                    if let Some(width) = get_type_width_by_name(&base_vtable_name, bv) {
+                        base_vtable_width = width;
                     }
 
                     // Set the base structure in the new vtable
@@ -900,11 +905,7 @@ impl<'a> Class {
                 );
 
                 // Get the width of this base class
-                let base_width = if let Some(base_type) = bv.type_by_id(&base_type_id) {
-                    base_type.width()
-                } else {
-                    0
-                };
+                let base_width = get_type_width_by_name(&base_class, bv).unwrap_or(0);
 
                 let base_struct = BaseStructure::new(base_ref, cumulative_width, base_width);
                 base_structures.push(base_struct);
@@ -947,10 +948,8 @@ impl<'a> Class {
                     );
 
                     // Update offset for next base class using the actual size/width
-                    if let Some(base_type_id) = bv.type_id_by_name(base_class) {
-                        if let Some(base_type) = bv.type_by_id(&base_type_id) {
-                            current_offset += base_type.width();
-                        }
+                    if let Some(width) = get_type_width_by_name(&base_class, bv) {
+                        current_offset += width;
                     }
                 }
             }
@@ -989,10 +988,8 @@ impl<'a> Class {
                             break;
                         }
                         // Add the size of previous base classes
-                        if let Some(prev_base_type_id) = bv.type_id_by_name(base) {
-                            if let Some(prev_base_type) = bv.type_by_id(&prev_base_type_id) {
-                                actual_offset += prev_base_type.width();
-                            }
+                        if let Some(width) = get_type_width_by_name(&base, bv) {
+                            actual_offset += width;
                         }
                     }
 
@@ -1039,6 +1036,51 @@ pub enum Member {
         args: Vec<(String, Ref<Type>)>,
     },
 }
+
+impl PartialEq for Member {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Member::Basic {
+                    name: name1,
+                    typ: typ1,
+                    ..
+                },
+                Member::Basic {
+                    name: name2,
+                    typ: typ2,
+                    ..
+                },
+            ) => name1 == name2 && typ1.to_string() == typ2.to_string(),
+            (
+                Member::Function {
+                    name: name1,
+                    ret: ret1,
+                    args: args1,
+                    ..
+                },
+                Member::Function {
+                    name: name2,
+                    ret: ret2,
+                    args: args2,
+                    ..
+                },
+            ) => {
+                name1 == name2
+                    && ret1.to_string() == ret2.to_string()
+                    && args1.len() == args2.len()
+                    && args1.iter().zip(args2.iter()).all(
+                        |((arg_name1, type1), (arg_name2, type2))| {
+                            arg_name1 == arg_name2 && type1.to_string() == type2.to_string()
+                        },
+                    )
+            }
+            _ => false, // Different variants are not equal
+        }
+    }
+}
+
+impl Eq for Member {}
 
 impl<'a> Member {
     /// Defines a type with specified pointer depth in Binary Ninja
@@ -1184,7 +1226,7 @@ impl<'a> Member {
             Member::Basic {
                 name,
                 typ,
-                comments,
+                comments: _,
             } => {
                 // Simply append basic members
                 dbg!(&format!("Adding member: {name}"));
@@ -1282,7 +1324,9 @@ fn parse_template_member_definition(s: &str) -> Vec<String> {
 /// Parses template instantiation like `temp<type1, type2<type3, type4>>`
 ///
 /// The input should be the text within the opening `<` and closing `>`.
-/// Handles nested template arguments with proper bracket matching.
+/// Handles nested template arguments with proper bracket matching. Used for
+/// finding the types to substitute into generic typenames when instantiating
+/// a templated structure or class.
 ///
 /// # Arguments
 /// * `s` - The template instantiation string (contents between angle brackets)
@@ -1344,11 +1388,12 @@ fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
 /// Parses template parameter names from template definition
 ///
 /// Extracts template parameter names from the contents between angle brackets.
-/// Filters out keywords like 'typename' and 'class'.
+/// Filters out keywords like 'typename' and 'class'. Used to find the generic
+/// typenames when parsing the definition of a template struct or class.
 ///
 /// # Arguments
 /// * `s` - The template definition string (contents between angle brackets), like
-/// `typename1, struct_two<typename2, typename3>`.
+/// `typename1, typename2`.
 ///
 /// # Returns
 /// `Some(Vec<String>)` with template parameter names, `None` if parsing fails
@@ -1578,12 +1623,12 @@ impl<'a> Parser<'a> {
                             dbg!(format!("Got template type {s2}"));
                             let typenames = parse_template_definition(s2)
                                 .expect(&format!("Could not parse template definitions {s2}"));
-                            let (i3, c3, mut s3) = find_next_token(&contents[idx + i2 + 1..])
+                            let (i3, c3, s3) = find_next_token(&contents[idx + i2 + 1..])
                                 .expect("Could not find closing token for template definition");
                             assert!(c3 == '{');
                             dbg!(format!("{typenames:?}"));
                             dbg!(format!("Got template name {s3}"));
-                            let (i4, _, mut body) =
+                            let (i4, _, body) =
                                 find_closing_token(&contents[idx + i2 + i3 + 2..], c3)
                                     .expect("Could not find closing token");
                             dbg!(format!("Got template definition {body}"));
@@ -1798,7 +1843,10 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
 
-    use crate::{parse_template_definition, Parser};
+    use crate::{
+        get_type_width_by_name, is_primitive, parse_template_definition,
+        parse_template_instantiation, Member, Parser, Structure, Template,
+    };
 
     #[test]
     fn test_parsing() {
@@ -1825,5 +1873,275 @@ mod tests {
         let typenames = parse_template_definition(s);
         assert_eq!(typenames.as_ref().unwrap().get(0), Some(&"X".to_string()));
         assert_eq!(typenames.as_ref().unwrap().get(1), Some(&"YZ".to_string()));
+        let s = "T1, T2";
+        let typenames = parse_template_definition(s);
+        assert_eq!(typenames.as_ref().unwrap().get(0), Some(&"T1".to_string()));
+        assert_eq!(typenames.as_ref().unwrap().get(1), Some(&"T2".to_string()));
+    }
+
+    #[test]
+    fn test_template_instantiation_parsing() {
+        let s = "uint32_t";
+        let typenames = parse_template_instantiation(s);
+        assert_eq!(
+            typenames.as_ref().unwrap().get(0),
+            Some(&"uint32_t".to_string())
+        );
+        let s = "uint32_t, void*";
+        let typenames = parse_template_instantiation(s);
+        assert_eq!(
+            typenames.as_ref().unwrap().get(0),
+            Some(&"uint32_t".to_string())
+        );
+        assert_eq!(
+            typenames.as_ref().unwrap().get(1),
+            Some(&"void*".to_string())
+        );
+        let s = "uint32_t, structure_name<void*, struct2_name>";
+        let typenames = parse_template_instantiation(s);
+        assert_eq!(
+            typenames.as_ref().unwrap().get(0),
+            Some(&"uint32_t".to_string())
+        );
+        assert_eq!(
+            typenames.as_ref().unwrap().get(1),
+            Some(&"structure_name<void*, struct2_name>".to_string())
+        );
+        let s = "structure_name<void*, struct2_name>, bool";
+        let typenames = parse_template_instantiation(s);
+        assert_eq!(
+            typenames.as_ref().unwrap().get(0),
+            Some(&"structure_name<void*, struct2_name>".to_string())
+        );
+        assert_eq!(
+            typenames.as_ref().unwrap().get(1),
+            Some(&"bool".to_string())
+        );
+        let s = "structure_name<void*, struct2_name<uint32_t, bool, void**>>, class_name<void*, uint64_t>";
+        let typenames = parse_template_instantiation(s);
+        assert_eq!(
+            typenames.as_ref().unwrap().get(0),
+            Some(&"structure_name<void*, struct2_name<uint32_t, bool, void**>>".to_string())
+        );
+        assert_eq!(
+            typenames.as_ref().unwrap().get(1),
+            Some(&"class_name<void*, uint64_t>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_primitive() {
+        // Test primitive types that should return Some
+        assert!(is_primitive("char").is_some());
+        assert!(is_primitive("unsigned char").is_some());
+        assert!(is_primitive("int8_t").is_some());
+        assert!(is_primitive("uint8_t").is_some());
+        assert!(is_primitive("int16_t").is_some());
+        assert!(is_primitive("uint16_t").is_some());
+        assert!(is_primitive("int32_t").is_some());
+        assert!(is_primitive("uint32_t").is_some());
+        assert!(is_primitive("int").is_some());
+        assert!(is_primitive("unsigned int").is_some());
+        assert!(is_primitive("int64_t").is_some());
+        assert!(is_primitive("uint64_t").is_some());
+        assert!(is_primitive("bool").is_some());
+        assert!(is_primitive("void").is_some());
+
+        // Test non-primitive types that should return None
+        assert!(is_primitive("MyStruct").is_none());
+        assert!(is_primitive("std::string").is_none());
+        assert!(is_primitive("vector<int>").is_none());
+        assert!(is_primitive("custom_type").is_none());
+        assert!(is_primitive("").is_none());
+        assert!(is_primitive("float").is_none()); // not in the primitive map
+        assert!(is_primitive("double").is_none()); // not in the primitive map
+    }
+
+    #[test]
+    fn test_member_new_with_template_substitution() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // First, define the basic types needed by templates
+        // Define struct2_name as a basic struct
+        let mut basic_struct = Structure::new("struct2_name", "int32_t x;", bv.as_ref());
+        basic_struct.define(bv.as_ref());
+        assert_eq!(get_type_width_by_name(&"struct2_name", &bv), Some(4));
+
+        // Define class_name as a basic struct
+        let mut class_struct = Structure::new(
+            "class_name",
+            "int32_t field1;\nint32_t field2;",
+            bv.as_ref(),
+        );
+        class_struct.define(bv.as_ref());
+        assert_eq!(get_type_width_by_name(&"class_name", &bv), Some(8));
+
+        // Define a simple template structure
+        let simple_template = Template::new("structure_name", "T value;", vec!["T".to_string()]);
+
+        // Define template instantiations needed for the test
+        // structure_name<uint32_t> and structure_name<void*>
+        simple_template.define(vec!["uint32_t".to_string()], bv.as_ref());
+        assert_eq!(
+            get_type_width_by_name(&"structure_name<uint32_t>", &bv),
+            Some(4)
+        );
+        simple_template.define(vec!["void*".to_string()], bv.as_ref());
+        assert_eq!(
+            get_type_width_by_name(&"structure_name<void*>", &bv),
+            Some(8)
+        );
+
+        // Define a two-parameter template structure
+        let two_param_template = Template::new(
+            "structure_name_two",
+            "T value1;\nU value2;",
+            vec!["T".to_string(), "U".to_string()],
+        );
+
+        // Define template instantiations needed for the test
+        // structure_name_two<uint32_t, void*>
+        two_param_template.define(
+            vec!["uint32_t".to_string(), "void*".to_string()],
+            bv.as_ref(),
+        );
+        assert_eq!(
+            get_type_width_by_name(&"structure_name_two<uint32_t, void*>", &bv),
+            Some(0x10)
+        );
+
+        // Define a more complex template for nested tests
+        let nested_template = Template::new(
+            "nested_struct",
+            "T field1;\nU field2;",
+            vec!["T".to_string(), "U".to_string()],
+        );
+        // nested_struct<void*, struct2_name>
+        nested_template.define(
+            vec!["void*".to_string(), "struct2_name".to_string()],
+            bv.as_ref(),
+        );
+        // TODO check packed
+        assert_eq!(
+            get_type_width_by_name(&"nested_struct<void*, struct2_name>", &bv),
+            Some(0x10)
+        );
+
+        // Test templated function member
+        let templated_function = Template::new(
+            "function_struct",
+            "T (*complex_func)(U param1, T* param2)\n",
+            vec!["T".to_string(), "U".to_string()],
+        );
+        templated_function.define(vec!["void".to_string(), "int32_t".to_string()], bv.as_ref());
+        assert_eq!(
+            get_type_width_by_name(&"function_struct<void, int32_t>", &bv),
+            Some(8)
+        );
+
+        // Test simple template substitution
+        // T -> uint32_t
+        let template_members = vec!["T".to_string()];
+        let template_defs = vec!["uint32_t".to_string()];
+
+        let templated_member = Member::new(
+            "structure_name<T> member_name",
+            bv.as_ref(),
+            Some(&template_members),
+            Some(&template_defs),
+        );
+
+        let concrete_member = Member::new(
+            "structure_name<uint32_t> member_name",
+            bv.as_ref(),
+            None,
+            None,
+        );
+
+        // Both should have the same name and type
+        assert_eq!(templated_member, concrete_member);
+
+        // Test multiple template parameters: T, U -> uint32_t, void*
+        let template_members = vec!["T".to_string(), "U".to_string()];
+        let template_defs = vec!["uint32_t".to_string(), "void*".to_string()];
+
+        let templated_member = Member::new(
+            "structure_name_two<T, U> member_name",
+            bv.as_ref(),
+            Some(&template_members),
+            Some(&template_defs),
+        );
+
+        let concrete_member = Member::new(
+            "structure_name_two<uint32_t, void*> member_name",
+            bv.as_ref(),
+            None,
+            None,
+        );
+
+        assert_eq!(templated_member, concrete_member);
+
+        // Test template with pointer: T -> uint32_t for T* member
+        let template_members = vec!["T".to_string()];
+        let template_defs = vec!["uint32_t".to_string()];
+
+        let templated_member = Member::new(
+            "structure_name<T>* member_name",
+            bv.as_ref(),
+            Some(&template_members),
+            Some(&template_defs),
+        );
+
+        let concrete_member = Member::new(
+            "structure_name<uint32_t>* member_name",
+            bv.as_ref(),
+            None,
+            None,
+        );
+
+        assert_eq!(templated_member, concrete_member);
+
+        // Test templated function with single parameter: T -> uint32_t
+        let template_members = vec!["T".to_string()];
+        let template_defs = vec!["uint32_t".to_string()];
+
+        let templated_function = Member::new(
+            "T (*func_name)(T param)",
+            bv.as_ref(),
+            Some(&template_members),
+            Some(&template_defs),
+        );
+
+        let concrete_function = Member::new(
+            "uint32_t (*func_name)(uint32_t param)",
+            bv.as_ref(),
+            None,
+            None,
+        );
+
+        assert_eq!(templated_function, concrete_function);
+
+        // Test templated function with multiple parameters: T, U -> void, int32_t
+        let template_members = vec!["T".to_string(), "U".to_string()];
+        let template_defs = vec!["void".to_string(), "int32_t".to_string()];
+
+        let templated_function = Member::new(
+            "T (*complex_func)(U param1, T* param2)",
+            bv.as_ref(),
+            Some(&template_members),
+            Some(&template_defs),
+        );
+
+        let concrete_function = Member::new(
+            "void (*complex_func)(int32_t param1, void* param2)",
+            bv.as_ref(),
+            None,
+            None,
+        );
+
+        assert_eq!(templated_function, concrete_function);
     }
 }
