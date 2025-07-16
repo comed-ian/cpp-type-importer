@@ -104,3 +104,10 @@ class MMM : HHH, III, LLL {
 typedef MMM NNN;
 
 typedef Abc<int32_t, bool>* OOO;
+
+struct __attribute__((packed)) PPP {
+    bool a;
+    uint32_t b;
+    char* c;
+    aaa d;
+};

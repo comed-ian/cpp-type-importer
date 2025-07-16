@@ -15,10 +15,9 @@ use std::path::PathBuf;
 
 // TODO
 // 1. Namespaces
-// 2. Packed
-// 3. Multi-level inheritance
-// 4. Templated Typedefs
-// 5. Conflicting vtable function names (e.g., MyMethod)
+// 2. Multi-level inheritance
+// 3. Templated Typedefs
+// 4. Conflicting vtable function names (e.g., MyMethod)
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -272,6 +271,8 @@ pub struct Structure {
     members: Vec<Member>,
     /// Base offset for the struct
     offset: u16,
+    /// Whether the struct is packed (no padding)
+    packed: bool,
 }
 
 impl<'a> Structure {
@@ -287,6 +288,10 @@ impl<'a> Structure {
     /// A new `Structure` instance
     pub fn new<'b>(def: &str, body: &str, bv: &'a BinaryView) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse definition {def} for name"));
+
+        // Check for packed attribute in the definition
+        let packed = def.contains("__attribute__((packed))");
+
         let mut members = vec![];
         for member in body.lines() {
             // Create a new member with no templated fields
@@ -297,6 +302,7 @@ impl<'a> Structure {
             name,
             members,
             offset: 0,
+            packed,
         }
     }
 
@@ -316,6 +322,7 @@ impl<'a> Structure {
             name,
             members,
             offset,
+            packed: false,
         }
     }
 
@@ -330,11 +337,21 @@ impl<'a> Structure {
     /// TODO warn and return false anything fails
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
         let mut builder = StructureBuilder::new();
+
+        // Set packed flag if the structure is packed
+        if self.packed {
+            builder.packed(true);
+        }
+
         for m in self.members.iter_mut() {
             m.define(None, &mut builder, bv);
         }
         let s = Type::structure(&builder.finalize());
-        dbg!(format!("Defining structure {}", self.name));
+        dbg!(format!(
+            "Defining {} structure {}",
+            if self.packed { "(packed)" } else { "" },
+            self.name
+        ));
         bv.define_user_type(&self.name, &s);
         true
     }
@@ -1425,15 +1442,17 @@ fn parse_template_definition(s: &str) -> Option<Vec<String>> {
 /// Parses the name from a class, struct, template, or enum definition
 ///
 /// Extracts the type name from definitions like "struct MyStruct" or "class MyClass"
-/// by stripping the preceding type identifier.
+/// by stripping the preceding type identifier and any trailing attributes.
 ///
 /// # Arguments
-/// * `def` - The definition string, e.g., `struct MyStruct`
+/// * `def` - The definition string, e.g., `struct MyStruct` or `struct __attribute__((packed)) MyStruct`
 ///
 /// # Returns
 /// `Some(String)` with the parsed name, `None` if parsing fails
 fn parse_name(def: &str) -> Option<String> {
     let mut s = def.trim();
+
+    // Strip type keywords
     if s.starts_with("struct ") {
         s = s.strip_prefix("struct ")?;
     } else if s.starts_with("class ") {
@@ -1443,6 +1462,16 @@ fn parse_name(def: &str) -> Option<String> {
     } else if s.starts_with("template ") {
         s.strip_prefix("template ")?;
     }
+
+    // Handle attributes that come after the type keyword but before the name
+    // e.g., "struct __attribute__((packed)) MyStruct"
+    if s.starts_with("__attribute__") {
+        // Find the end of the attribute and skip it
+        if let Some(end) = s.find("))") {
+            s = s[end + 2..].trim();
+        }
+    }
+
     Some(s.to_string())
 }
 
@@ -1844,7 +1873,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        get_type_width_by_name, is_primitive, parse_template_definition,
+        get_type_width_by_name, is_primitive, parse_name, parse_template_definition,
         parse_template_instantiation, Member, Parser, Structure, Template,
     };
 
@@ -2143,5 +2172,75 @@ mod tests {
         );
 
         assert_eq!(templated_function, concrete_function);
+    }
+
+    #[test]
+    fn test_packed_structure() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Create a regular structure with padding
+        let regular_struct_def = "struct RegularStruct";
+        let regular_struct_body = "char a;\nint32_t b;\nchar c;";
+        let mut regular_struct =
+            Structure::new(regular_struct_def, regular_struct_body, bv.as_ref());
+        regular_struct.define(bv.as_ref());
+
+        // Create a packed structure without padding
+        let packed_struct_def = "struct __attribute__((packed)) PackedStruct";
+        let packed_struct_body = "char a;\nint32_t b;\nchar c;";
+        let mut packed_struct = Structure::new(packed_struct_def, packed_struct_body, bv.as_ref());
+        packed_struct.define(bv.as_ref());
+
+        // Verify the packed flag was set correctly
+        assert!(
+            packed_struct.packed,
+            "Packed struct should have packed flag set"
+        );
+        assert!(
+            !regular_struct.packed,
+            "Regular struct should not have packed flag set"
+        );
+
+        // Get the sizes of both structures
+        let regular_size = get_type_width_by_name("RegularStruct", &bv)
+            .expect("Could not get regular struct size");
+        let packed_size =
+            get_type_width_by_name("PackedStruct", &bv).expect("Could not get packed struct size");
+
+        // The packed structure should be smaller than the regular structure
+        // Regular: char(1) + 3 padding + int32_t(4) + char(1) + 3 padding = 12 bytes
+        // Packed: char(1) + int32_t(4) + char(1) = 6 bytes
+        assert_eq!(
+            regular_size, 12,
+            "Regular struct should be 12 bytes with padding"
+        );
+        assert_eq!(
+            packed_size, 6,
+            "Packed struct should be 6 bytes without padding"
+        );
+
+        println!("Regular struct size: {} bytes", regular_size);
+        println!("Packed struct size: {} bytes", packed_size);
+    }
+
+    #[test]
+    fn test_parse_name_with_packed_attribute() {
+        // Test regular struct name parsing
+        assert_eq!(parse_name("struct MyStruct"), Some("MyStruct".to_string()));
+
+        // Test packed struct name parsing - attribute between struct and name
+        assert_eq!(
+            parse_name("struct __attribute__((packed)) MyPackedStruct"),
+            Some("MyPackedStruct".to_string())
+        );
+
+        // Test class name parsing
+        assert_eq!(parse_name("class MyClass"), Some("MyClass".to_string()));
+
+        // Test enum name parsing
+        assert_eq!(parse_name("enum MyEnum"), Some("MyEnum".to_string()));
     }
 }
