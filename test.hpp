@@ -111,3 +111,25 @@ struct __attribute__((packed)) PPP {
     char* c;
     aaa d;
 };
+
+namespace QQQ {
+    struct aaa {
+        uint32_t a;
+        void* b;
+    };
+
+    namespace RRR {
+        struct aaa {
+            void* a;
+            uint32_t b;
+        };
+
+        struct bbb {
+            aaa* a;
+        };
+
+        struct ccc {
+            QQQ::aaa a;
+        };
+    } // end RRR
+} // end QQQ

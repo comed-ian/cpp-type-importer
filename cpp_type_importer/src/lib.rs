@@ -14,10 +14,9 @@ use std::io::Read;
 use std::path::PathBuf;
 
 // TODO
-// 1. Namespaces
-// 2. Multi-level inheritance
-// 3. Templated Typedefs
-// 4. Conflicting vtable function names (e.g., MyMethod)
+// 1. Multi-level inheritance
+// 2. Templated Typedefs
+// 3. Conflicting vtable function names (e.g., MyMethod)
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -68,6 +67,8 @@ pub struct Enum {
     size: u8,
     /// List of enum values as (name, numeric_value) pairs
     values: Vec<(String, u64)>,
+    /// Namespace path for this enum
+    namespace_path: Vec<String>,
 }
 
 impl<'a> Enum {
@@ -80,7 +81,7 @@ impl<'a> Enum {
     ///
     /// # Returns
     /// A new `Enum` instance with parsed values
-    pub fn new(name: &str, size: u8, body: &str) -> Self {
+    pub fn new(name: &str, size: u8, body: &str, namespace_path: Vec<String>) -> Self {
         let mut values = Vec::new();
         // Enum values increment from the prior value if not specified,
         // with the default being 0
@@ -125,6 +126,7 @@ impl<'a> Enum {
             name: name.to_string(),
             size,
             values,
+            namespace_path,
         }
     }
 
@@ -135,6 +137,15 @@ impl<'a> Enum {
     ///
     /// # Returns
     /// `true` if the enum was successfully defined
+    /// Gets the full name including namespace prefix
+    fn get_full_name(&self) -> String {
+        if self.namespace_path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        }
+    }
+
     pub fn define(&self, bv: &BinaryView) -> bool {
         // Create an enumeration builder
         let mut builder = EnumerationBuilder::new();
@@ -150,7 +161,10 @@ impl<'a> Enum {
         let width = std::num::NonZeroUsize::new(self.size as usize)
             .unwrap_or_else(|| std::num::NonZeroUsize::new(4).unwrap());
         let enum_type = Type::enumeration(&enumeration, width, false);
-        bv.define_user_type(&self.name, &enum_type);
+
+        // Construct full name with namespace prefix
+        let full_name = self.get_full_name();
+        bv.define_user_type(&full_name, &enum_type);
         true
     }
 }
@@ -165,13 +179,28 @@ pub struct Typedef {
     name: String,
     typ: String,
     depth: u8,
+    namespace_path: Vec<String>,
 }
 
 impl<'a> Typedef {
-    pub fn new(def: &str) -> Self {
+    pub fn new(def: &str, namespace_path: Vec<String>) -> Self {
         let (typ, name, depth) =
             parse_member_definition(def).expect("Could not parse typedef definition");
-        Self { name, typ, depth }
+        Self {
+            name,
+            typ,
+            depth,
+            namespace_path,
+        }
+    }
+
+    /// Gets the full name including namespace prefix
+    fn get_full_name(&self) -> String {
+        if self.namespace_path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        }
     }
 
     pub fn define(&self, bv: &'a BinaryView) -> bool {
@@ -181,7 +210,10 @@ impl<'a> Typedef {
             Member::define_type(&self.typ, self.depth, bv)
         };
         log::info!("Got typedef target type: {}", target_type);
-        bv.define_user_type(&self.name, &target_type);
+
+        // Construct full name with namespace prefix
+        let full_name = self.get_full_name();
+        bv.define_user_type(&full_name, &target_type);
         true
     }
 }
@@ -198,6 +230,8 @@ pub struct Template {
     typenames: Vec<String>,
     /// The template body containing member definitions
     body: String,
+    /// Namespace path for this template
+    namespace_path: Vec<String>,
 }
 
 impl<'a> Template {
@@ -211,12 +245,13 @@ impl<'a> Template {
     ///
     /// # Returns
     /// A new `Template` instance
-    pub fn new(def: &str, body: &str, typenames: Vec<String>) -> Self {
+    pub fn new(def: &str, body: &str, typenames: Vec<String>, namespace_path: Vec<String>) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse name from {def}"));
         Self {
             name,
             typenames,
             body: body.to_string(),
+            namespace_path,
         }
     }
 
@@ -248,6 +283,7 @@ impl<'a> Template {
                 bv,
                 Some(&self.typenames),
                 Some(&typenames),
+                &self.namespace_path,
             ));
         }
         // `self.name` is simply the name of the templated structure. Add
@@ -257,7 +293,16 @@ impl<'a> Template {
         name.push('<');
         name.push_str(&typenames.join(", "));
         name.push('>');
-        Structure::new_from_members(name, members, 0).define(bv);
+        Structure::new_from_members(name, members, 0, self.namespace_path.clone()).define(bv);
+    }
+
+    /// Gets the full name including namespace prefix
+    fn get_full_name(&self) -> String {
+        if self.namespace_path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        }
     }
 }
 
@@ -275,6 +320,8 @@ pub struct Structure {
     offset: u16,
     /// Whether the struct is packed (no padding)
     packed: bool,
+    /// Namespace path for this structure
+    namespace_path: Vec<String>,
 }
 
 impl<'a> Structure {
@@ -288,7 +335,7 @@ impl<'a> Structure {
     ///
     /// # Returns
     /// A new `Structure` instance
-    pub fn new<'b>(def: &str, body: &str, bv: &'a BinaryView) -> Self {
+    pub fn new<'b>(def: &str, body: &str, bv: &'a BinaryView, namespace_path: Vec<String>) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse definition {def} for name"));
 
         // Check for packed attribute in the definition
@@ -297,7 +344,7 @@ impl<'a> Structure {
         let mut members = vec![];
         for member in body.lines() {
             // Create a new member with no templated fields
-            members.push(Member::new(member, bv, None, None));
+            members.push(Member::new(member, bv, None, None, &namespace_path));
         }
 
         Self {
@@ -305,6 +352,7 @@ impl<'a> Structure {
             members,
             offset: 0,
             packed,
+            namespace_path,
         }
     }
 
@@ -319,12 +367,18 @@ impl<'a> Structure {
     ///
     /// # Returns
     /// A new `Structure` instance
-    pub fn new_from_members(name: String, members: Vec<Member>, offset: u16) -> Self {
+    pub fn new_from_members(
+        name: String,
+        members: Vec<Member>,
+        offset: u16,
+        namespace_path: Vec<String>,
+    ) -> Self {
         Self {
             name,
             members,
             offset,
             packed: false,
+            namespace_path,
         }
     }
 
@@ -349,13 +403,23 @@ impl<'a> Structure {
             m.define(None, &mut builder, bv);
         }
         let s = Type::structure(&builder.finalize());
+        let full_name = self.get_full_name();
         log::debug!(
             "Defining {} structure {}",
             if self.packed { "(packed)" } else { "" },
-            self.name
+            full_name
         );
-        bv.define_user_type(&self.name, &s);
+        bv.define_user_type(&full_name, &s);
         true
+    }
+
+    /// Gets the full name including namespace prefix
+    fn get_full_name(&self) -> String {
+        if self.namespace_path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        }
     }
 }
 
@@ -373,6 +437,8 @@ pub struct Class {
     member_variables: Vec<(Member, Option<String>)>,
     /// List of base class names for inheritance
     base_classes: Vec<String>,
+    /// Namespace path for this class
+    namespace_path: Vec<String>,
 }
 
 impl<'a> Class {
@@ -386,7 +452,7 @@ impl<'a> Class {
     ///
     /// # Returns
     /// A new `Class` instance
-    pub fn new(def: &str, body: &str, bv: &'a BinaryView) -> Self {
+    pub fn new(def: &str, body: &str, bv: &'a BinaryView, namespace_path: Vec<String>) -> Self {
         // Parse class name and inheritance with regex
         // TODO parse inherited classes differently, inherited classes could be templated
         let class_regex = Regex::new(r"class\s+(\w+)(?:\s*:\s*(.+))?").unwrap();
@@ -414,7 +480,12 @@ impl<'a> Class {
 
         // Forward-declare the class as a structure so it can be referenced in constructor signatures
         let forward_decl = Type::structure(&StructureBuilder::new().finalize());
-        bv.define_user_type(&name, &forward_decl);
+        let full_name = if namespace_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", namespace_path.join("::"), name)
+        };
+        bv.define_user_type(&full_name, &forward_decl);
 
         let mut vtable_methods = Vec::new();
         let mut member_variables = Vec::new();
@@ -452,7 +523,10 @@ impl<'a> Class {
 
                 // Remove override comment from the line
                 let clean_line = override_regex.replace(line, "").trim().to_string();
-                member_variables.push((Member::new(&clean_line, bv, None, None), override_info));
+                member_variables.push((
+                    Member::new(&clean_line, bv, None, None, &namespace_path),
+                    override_info,
+                ));
             }
         }
 
@@ -461,6 +535,7 @@ impl<'a> Class {
             vtable_methods,
             member_variables,
             base_classes,
+            namespace_path,
         }
     }
 
@@ -542,7 +617,7 @@ impl<'a> Class {
             } else {
                 format!("void (*~{class_name})();")
             };
-            return Member::new(&method_signature, bv, None, None).into();
+            return Member::new(&method_signature, bv, None, None, &Vec::new()).into();
         }
 
         // Check for constructor: ClassName(...)
@@ -580,7 +655,7 @@ impl<'a> Class {
                     format!("void (*{class_name})({});", all_params.join(", "))
                 };
 
-                return Member::new(&method_signature, bv, None, None).into();
+                return Member::new(&method_signature, bv, None, None, &Vec::new()).into();
             }
         }
 
@@ -627,7 +702,7 @@ impl<'a> Class {
                 format!("{return_type} (*{method_name})({});", all_params.join(", "))
             };
 
-            Member::new(&method_signature, bv, None, None).into()
+            Member::new(&method_signature, bv, None, None, &Vec::new()).into()
         } else {
             None
         }
@@ -1028,9 +1103,19 @@ impl<'a> Class {
 
         // Define the class structure
         let class_structure = Type::structure(&class_builder.finalize());
-        bv.define_user_type(&self.name, &class_structure);
+        let full_name = self.get_full_name();
+        bv.define_user_type(&full_name, &class_structure);
 
         true
+    }
+
+    /// Gets the full name including namespace prefix
+    fn get_full_name(&self) -> String {
+        if self.namespace_path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        }
     }
 }
 
@@ -1116,16 +1201,26 @@ impl<'a> Member {
     /// # Returns
     /// Binary Ninja type reference for the defined type
     fn define_type(t: &str, depth: u8, bv: &BinaryView) -> Ref<Type> {
+        Self::define_type_with_namespace(t, depth, bv, &Vec::new())
+    }
+
+    fn define_type_with_namespace(
+        t: &str,
+        depth: u8,
+        bv: &BinaryView,
+        current_namespace: &Vec<String>,
+    ) -> Ref<Type> {
         log::debug!("Defining type: {}", t);
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
-            // Try to find an existing type ID
-            if let Some(type_id) = bv.type_id_by_name(t) {
+            // Try to resolve the type with namespace resolution
+            let resolved_type = Self::resolve_type_name(t, bv, current_namespace);
+            if let Some(type_id) = bv.type_id_by_name(&resolved_type) {
                 let named_ref = NamedTypeReference::new_with_id(
                     NamedTypeReferenceClass::StructNamedTypeClass,
                     &type_id,
-                    t,
+                    &resolved_type,
                 );
                 // Hack: `Type::named_type(&named_ref)` always returns
                 // a reference with width 0, making any member structs
@@ -1141,7 +1236,7 @@ impl<'a> Member {
                 )
             } else {
                 // TODO consider returning option and warn
-                panic!("Could not find type: {}", t);
+                panic!("Could not find type: {}", resolved_type);
             }
         };
         for _ in 0..depth {
@@ -1153,6 +1248,36 @@ impl<'a> Member {
         typ
     }
 
+    /// Resolves a type name with namespace context
+    fn resolve_type_name(
+        type_name: &str,
+        bv: &BinaryView,
+        current_namespace: &Vec<String>,
+    ) -> String {
+        // If the type name already contains :: it's fully qualified
+        if type_name.contains("::") {
+            return type_name.to_string();
+        }
+
+        // Try to find the type in the current namespace hierarchy
+        // Start from the most specific namespace and work outward
+        for i in (0..=current_namespace.len()).rev() {
+            let namespace_path = &current_namespace[0..i];
+            let candidate_name = if namespace_path.is_empty() {
+                type_name.to_string()
+            } else {
+                format!("{}::{}", namespace_path.join("::"), type_name)
+            };
+
+            if bv.type_id_by_name(&candidate_name).is_some() {
+                return candidate_name;
+            }
+        }
+
+        // If not found in any namespace, return the original name
+        type_name.to_string()
+    }
+
     /// Creates a new member from its definition string
     ///
     /// # Arguments
@@ -1160,6 +1285,7 @@ impl<'a> Member {
     /// * `bv` - Binary Ninja binary view reference
     /// * `template_members` - Optional template parameter names
     /// * `template_defs` - Optional template parameter definitions
+    /// * `current_namespace` - Current namespace context for type resolution
     ///
     /// # Returns
     /// A new `Member` instance
@@ -1168,6 +1294,7 @@ impl<'a> Member {
         bv: &BinaryView,
         template_members: Option<&Vec<String>>,
         template_defs: Option<&Vec<String>>,
+        current_namespace: &Vec<String>,
     ) -> Self {
         let (typ, name, depth) =
             parse_member_definition(def).expect("Could not parse member definition");
@@ -1223,19 +1350,27 @@ impl<'a> Member {
                 for a in args {
                     let (typ, name, depth) = parse_member_definition(&a)
                         .expect("Could not parse argument to function definition");
-                    defined_args.push((name, Self::define_type(&typ, depth, bv)));
+                    defined_args.push((
+                        name,
+                        Self::define_type_with_namespace(&typ, depth, bv, current_namespace),
+                    ));
                 }
 
                 return Member::Function {
                     name: name.to_string(),
-                    ret: Self::define_type(&return_type, depth, bv),
+                    ret: Self::define_type_with_namespace(
+                        &return_type,
+                        depth,
+                        bv,
+                        current_namespace,
+                    ),
                     args: defined_args,
                 };
             } else {
                 // Not a function definition
                 let (typ, name, depth) =
                     parse_member_definition(&def).expect(&format!("Could not parse {def}"));
-                let typ = Self::define_type(&typ, depth, bv);
+                let typ = Self::define_type_with_namespace(&typ, depth, bv, current_namespace);
                 return Member::Basic {
                     name,
                     typ,
@@ -1563,7 +1698,7 @@ fn parse_member_name(s: &str) -> Option<String> {
 /// `Some((index, character, prefix))` if a token is found, `None` otherwise
 fn find_next_token(s: &str) -> Option<(usize, char, &str)> {
     for (i, c) in s.char_indices() {
-        if c == '{' || c == ';' || c == '<' || c == '"' {
+        if c == '{' || c == ';' || c == '<' || c == '"' || c == '}' {
             return Some((i, c, &s[..i]));
         }
     }
@@ -1606,6 +1741,8 @@ fn find_closing_token(s: &str, token: char) -> Option<(usize, char, &str)> {
 pub struct Parser<'a> {
     /// Binary Ninja binary view reference
     bv: &'a BinaryView,
+    /// Current namespace stack for tracking nested namespaces
+    namespace_stack: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -1617,7 +1754,10 @@ impl<'a> Parser<'a> {
     /// # Returns
     /// A new `Parser` instance
     pub fn new(bv: &'a BinaryView) -> Self {
-        Self { bv }
+        Self {
+            bv,
+            namespace_stack: Vec::new(),
+        }
     }
 
     /// Parses C++ header content and imports types into Binary Ninja
@@ -1627,7 +1767,25 @@ impl<'a> Parser<'a> {
     ///
     /// # Arguments
     /// * `contents` - The C++ header file content as a string
-    pub fn parse(self, contents: &str) {
+    /// Gets the current namespace path as a vector
+    fn get_current_namespace_path(&self) -> Vec<String> {
+        self.namespace_stack.clone()
+    }
+
+    /// Enters a new namespace
+    fn enter_namespace(&mut self, namespace_name: &str) {
+        self.namespace_stack.push(namespace_name.to_string());
+        log::info!("Entering namespace: {}", self.namespace_stack.join("::"));
+    }
+
+    /// Exits the current namespace
+    fn exit_namespace(&mut self) {
+        if let Some(namespace) = self.namespace_stack.pop() {
+            log::info!("Exiting namespace: {}", namespace);
+        }
+    }
+
+    pub fn parse(mut self, contents: &str) {
         let mut templates = Vec::<Template>::new();
         let mut idx = 0usize;
         loop {
@@ -1653,6 +1811,10 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 match c {
+                    '}' => {
+                        // Assume this is a namespace closing brace and exit current namespace
+                        self.exit_namespace();
+                    }
                     '<' => {
                         // template
                         if s.starts_with("template") {
@@ -1672,7 +1834,12 @@ impl<'a> Parser<'a> {
                                     .expect("Could not find closing token");
                             log::info!("Got template definition: {}", body);
                             idx += i3 + i4 + 2;
-                            let t = Template::new(s3, body, typenames);
+                            let t = Template::new(
+                                s3,
+                                body,
+                                typenames,
+                                self.get_current_namespace_path(),
+                            );
                             templates.push(t);
                             idx += i2 + 1;
                         } else {
@@ -1685,7 +1852,10 @@ impl<'a> Parser<'a> {
                                 typedef_string.push('<');
                                 typedef_string.push_str(&s2);
                                 log::info!("Got typedef string: {}", typedef_string);
-                                let t = Typedef::new(&typedef_string);
+                                let t = Typedef::new(
+                                    &typedef_string,
+                                    self.get_current_namespace_path(),
+                                );
                                 t.define(self.bv);
                             } else {
                                 log::info!("Handling line: {} {}", s, s2);
@@ -1709,7 +1879,7 @@ impl<'a> Parser<'a> {
                         if s.starts_with("typedef ") {
                             // typedef like `typedef struct_1 struct_2;`. Templated types
                             // match to `<` and are handled above.
-                            let t = Typedef::new(&s[8..]);
+                            let t = Typedef::new(&s[8..], self.get_current_namespace_path());
                             t.define(self.bv);
                         } else {
                             // forward declaration
@@ -1721,13 +1891,21 @@ impl<'a> Parser<'a> {
                         }
                     }
                     '{' => {
-                        // class or struct definition
-                        if s.starts_with("struct") {
+                        // namespace, class, or struct definition
+                        if s.starts_with("namespace") {
+                            // Extract namespace name
+                            let namespace_name = s.strip_prefix("namespace").unwrap().trim();
+                            if !namespace_name.is_empty() {
+                                self.enter_namespace(namespace_name);
+                                // Continue parsing inside the namespace
+                            }
+                        } else if s.starts_with("struct") {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
                             log::info!("Got struct {}: {}", s, s2);
-                            let mut structure = Structure::new(s, s2, self.bv);
+                            let mut structure =
+                                Structure::new(s, s2, self.bv, self.get_current_namespace_path());
                             structure.define(self.bv);
                             idx += i2 + 1;
                         } else if s.starts_with("class") {
@@ -1735,7 +1913,8 @@ impl<'a> Parser<'a> {
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
                             log::debug!("Got class {}: {}", s, s2);
-                            let class = Class::new(s, s2, self.bv);
+                            let class =
+                                Class::new(s, s2, self.bv, self.get_current_namespace_path());
                             class.define(self.bv);
                             idx += i2 + 1;
                         } else if s.starts_with("enum") {
@@ -1770,7 +1949,8 @@ impl<'a> Parser<'a> {
                                 };
 
                             log::info!("Got enum {} with size {}", enum_name, size);
-                            let enum_def = Enum::new(enum_name, size, s2);
+                            let enum_def =
+                                Enum::new(enum_name, size, s2, self.get_current_namespace_path());
                             enum_def.define(self.bv);
 
                             idx += i2 + 1;
@@ -1876,8 +2056,9 @@ mod tests {
 
     use crate::{
         get_type_width_by_name, is_primitive, parse_name, parse_template_definition,
-        parse_template_instantiation, Member, Parser, Structure, Template,
+        parse_template_instantiation, Class, Enum, Member, Parser, Structure, Template,
     };
+    use binaryninja::binary_view::BinaryViewExt;
 
     #[test]
     fn test_parsing() {
@@ -1893,7 +2074,10 @@ mod tests {
         file.read_to_string(&mut contents)
             .expect("Could not read file contents");
         println!("File contents:\n{}", contents);
-        let p = Parser { bv: bv.as_ref() };
+        let p = Parser {
+            bv: bv.as_ref(),
+            namespace_stack: vec![],
+        };
         p.parse(&contents);
     }
 
@@ -1996,7 +2180,8 @@ mod tests {
 
         // First, define the basic types needed by templates
         // Define struct2_name as a basic struct
-        let mut basic_struct = Structure::new("struct2_name", "int32_t x;", bv.as_ref());
+        let mut basic_struct =
+            Structure::new("struct2_name", "int32_t x;", bv.as_ref(), Vec::new());
         basic_struct.define(bv.as_ref());
         assert_eq!(get_type_width_by_name(&"struct2_name", &bv), Some(4));
 
@@ -2005,12 +2190,18 @@ mod tests {
             "class_name",
             "int32_t field1;\nint32_t field2;",
             bv.as_ref(),
+            Vec::new(),
         );
         class_struct.define(bv.as_ref());
         assert_eq!(get_type_width_by_name(&"class_name", &bv), Some(8));
 
         // Define a simple template structure
-        let simple_template = Template::new("structure_name", "T value;", vec!["T".to_string()]);
+        let simple_template = Template::new(
+            "structure_name",
+            "T value;",
+            vec!["T".to_string()],
+            Vec::new(),
+        );
 
         // Define template instantiations needed for the test
         // structure_name<uint32_t> and structure_name<void*>
@@ -2030,6 +2221,7 @@ mod tests {
             "structure_name_two",
             "T value1;\nU value2;",
             vec!["T".to_string(), "U".to_string()],
+            Vec::new(),
         );
 
         // Define template instantiations needed for the test
@@ -2048,6 +2240,7 @@ mod tests {
             "nested_struct",
             "T field1;\nU field2;",
             vec!["T".to_string(), "U".to_string()],
+            Vec::new(),
         );
         // nested_struct<void*, struct2_name>
         nested_template.define(
@@ -2065,6 +2258,7 @@ mod tests {
             "function_struct",
             "T (*complex_func)(U param1, T* param2)\n",
             vec!["T".to_string(), "U".to_string()],
+            Vec::new(),
         );
         templated_function.define(vec!["void".to_string(), "int32_t".to_string()], bv.as_ref());
         assert_eq!(
@@ -2082,6 +2276,7 @@ mod tests {
             bv.as_ref(),
             Some(&template_members),
             Some(&template_defs),
+            &Vec::new(),
         );
 
         let concrete_member = Member::new(
@@ -2089,6 +2284,7 @@ mod tests {
             bv.as_ref(),
             None,
             None,
+            &Vec::new(),
         );
 
         // Both should have the same name and type
@@ -2103,6 +2299,7 @@ mod tests {
             bv.as_ref(),
             Some(&template_members),
             Some(&template_defs),
+            &Vec::new(),
         );
 
         let concrete_member = Member::new(
@@ -2110,6 +2307,7 @@ mod tests {
             bv.as_ref(),
             None,
             None,
+            &Vec::new(),
         );
 
         assert_eq!(templated_member, concrete_member);
@@ -2123,6 +2321,7 @@ mod tests {
             bv.as_ref(),
             Some(&template_members),
             Some(&template_defs),
+            &Vec::new(),
         );
 
         let concrete_member = Member::new(
@@ -2130,6 +2329,7 @@ mod tests {
             bv.as_ref(),
             None,
             None,
+            &Vec::new(),
         );
 
         assert_eq!(templated_member, concrete_member);
@@ -2143,6 +2343,7 @@ mod tests {
             bv.as_ref(),
             Some(&template_members),
             Some(&template_defs),
+            &Vec::new(),
         );
 
         let concrete_function = Member::new(
@@ -2150,6 +2351,7 @@ mod tests {
             bv.as_ref(),
             None,
             None,
+            &Vec::new(),
         );
 
         assert_eq!(templated_function, concrete_function);
@@ -2163,6 +2365,7 @@ mod tests {
             bv.as_ref(),
             Some(&template_members),
             Some(&template_defs),
+            &Vec::new(),
         );
 
         let concrete_function = Member::new(
@@ -2170,6 +2373,7 @@ mod tests {
             bv.as_ref(),
             None,
             None,
+            &Vec::new(),
         );
 
         assert_eq!(templated_function, concrete_function);
@@ -2185,14 +2389,23 @@ mod tests {
         // Create a regular structure with padding
         let regular_struct_def = "struct RegularStruct";
         let regular_struct_body = "char a;\nint32_t b;\nchar c;";
-        let mut regular_struct =
-            Structure::new(regular_struct_def, regular_struct_body, bv.as_ref());
+        let mut regular_struct = Structure::new(
+            regular_struct_def,
+            regular_struct_body,
+            bv.as_ref(),
+            Vec::new(),
+        );
         regular_struct.define(bv.as_ref());
 
         // Create a packed structure without padding
         let packed_struct_def = "struct __attribute__((packed)) PackedStruct";
         let packed_struct_body = "char a;\nint32_t b;\nchar c;";
-        let mut packed_struct = Structure::new(packed_struct_def, packed_struct_body, bv.as_ref());
+        let mut packed_struct = Structure::new(
+            packed_struct_def,
+            packed_struct_body,
+            bv.as_ref(),
+            Vec::new(),
+        );
         packed_struct.define(bv.as_ref());
 
         // Verify the packed flag was set correctly
@@ -2243,5 +2456,303 @@ mod tests {
 
         // Test enum name parsing
         assert_eq!(parse_name("enum MyEnum"), Some("MyEnum".to_string()));
+    }
+
+    #[test]
+    fn test_namespace_parsing() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Test namespace stack functionality
+        let mut parser = Parser::new(bv.as_ref());
+
+        // Test entering and exiting namespaces
+        parser.enter_namespace("QQQ");
+        assert_eq!(parser.get_current_namespace_path(), vec!["QQQ".to_string()]);
+
+        parser.enter_namespace("RRR");
+        assert_eq!(
+            parser.get_current_namespace_path(),
+            vec!["QQQ".to_string(), "RRR".to_string()]
+        );
+
+        parser.exit_namespace();
+        assert_eq!(parser.get_current_namespace_path(), vec!["QQQ".to_string()]);
+
+        parser.exit_namespace();
+        assert_eq!(parser.get_current_namespace_path(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_namespace_structure_definitions() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define structures in different namespaces
+        let mut global_struct = Structure::new(
+            "struct aaa",
+            "int32_t a;\nint32_t b;",
+            bv.as_ref(),
+            Vec::new(),
+        );
+        global_struct.define(bv.as_ref());
+
+        let mut qqq_struct = Structure::new(
+            "struct aaa",
+            "uint32_t a;\nvoid* b;",
+            bv.as_ref(),
+            vec!["QQQ".to_string()],
+        );
+        qqq_struct.define(bv.as_ref());
+
+        let mut rrr_struct = Structure::new(
+            "struct aaa",
+            "void* a;\nuint32_t b;\nuint64_t c;",
+            bv.as_ref(),
+            vec!["QQQ".to_string(), "RRR".to_string()],
+        );
+        rrr_struct.define(bv.as_ref());
+
+        // Test get_full_name functionality
+        assert_eq!(global_struct.get_full_name(), "aaa");
+        assert_eq!(qqq_struct.get_full_name(), "QQQ::aaa");
+        assert_eq!(rrr_struct.get_full_name(), "QQQ::RRR::aaa");
+
+        // Verify types are defined in Binary Ninja with correct names
+        assert!(bv.type_id_by_name("aaa").is_some());
+        assert!(bv.type_id_by_name("QQQ::aaa").is_some());
+        assert!(bv.type_id_by_name("QQQ::RRR::aaa").is_some());
+
+        // Verify they have different sizes to confirm they're different types
+        assert_eq!(get_type_width_by_name("aaa", &bv), Some(8)); // int32_t + int32_t
+        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv), Some(0x10)); // uint32_t + void* (with padding)
+        assert_eq!(get_type_width_by_name("QQQ::RRR::aaa", &bv), Some(0x18)); // void* + uint32_t + uint64_t (with padding)
+    }
+
+    #[test]
+    fn test_namespace_type_resolution() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define types in different namespaces
+        let mut global_struct =
+            Structure::new("struct TestType", "int32_t x;", bv.as_ref(), Vec::new());
+        global_struct.define(bv.as_ref());
+
+        let mut ns_struct = Structure::new(
+            "struct TestType",
+            "uint32_t y;",
+            bv.as_ref(),
+            vec!["NS".to_string()],
+        );
+        ns_struct.define(bv.as_ref());
+
+        // Test type resolution from different namespace contexts
+        let global_context = Vec::new();
+        let ns_context = vec!["NS".to_string()];
+
+        // From global context, should find global type
+        assert_eq!(
+            Member::resolve_type_name("TestType", bv.as_ref(), &global_context),
+            "TestType"
+        );
+
+        // From NS context, should find namespaced type first
+        assert_eq!(
+            Member::resolve_type_name("TestType", bv.as_ref(), &ns_context),
+            "NS::TestType"
+        );
+
+        // Fully qualified names should resolve as-is
+        assert_eq!(
+            Member::resolve_type_name("NS::TestType", bv.as_ref(), &global_context),
+            "NS::TestType"
+        );
+    }
+
+    #[test]
+    fn test_namespace_member_resolution() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define a type in a namespace
+        let mut ns_struct = Structure::new(
+            "struct MyType",
+            "int32_t value;",
+            bv.as_ref(),
+            vec!["TestNS".to_string()],
+        );
+        ns_struct.define(bv.as_ref());
+
+        // Create a member that references this type from within the same namespace
+        let member = Member::new(
+            "MyType member_field",
+            bv.as_ref(),
+            None,
+            None,
+            &vec!["TestNS".to_string()],
+        );
+
+        // Should resolve to the namespaced type
+        if let Member::Basic { typ, .. } = member {
+            // The type should be resolved to the namespaced version
+            assert!(typ.to_string().contains("TestNS::MyType"));
+        } else {
+            panic!("Expected basic member");
+        }
+    }
+
+    #[test]
+    fn test_namespace_enum_definitions() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define enums in different namespaces
+        let global_enum = Enum::new("GlobalEnum", 4, "VALUE1,\nVALUE2,\nVALUE3", Vec::new());
+        global_enum.define(bv.as_ref());
+
+        let ns_enum = Enum::new(
+            "GlobalEnum",
+            4,
+            "NS_VALUE1,\nNS_VALUE2",
+            vec!["MyNS".to_string()],
+        );
+        ns_enum.define(bv.as_ref());
+
+        // Test get_full_name functionality for enums
+        assert_eq!(global_enum.get_full_name(), "GlobalEnum");
+        assert_eq!(ns_enum.get_full_name(), "MyNS::GlobalEnum");
+
+        // Verify types are defined in Binary Ninja with correct names
+        assert!(bv.type_id_by_name("GlobalEnum").is_some());
+        assert!(bv.type_id_by_name("MyNS::GlobalEnum").is_some());
+    }
+
+    #[test]
+    fn test_namespace_template_definitions() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define templates in different namespaces
+        let global_template =
+            Template::new("Container", "T value;", vec!["T".to_string()], Vec::new());
+
+        let ns_template = Template::new(
+            "Container",
+            "T data;\nint32_t size;",
+            vec!["T".to_string()],
+            vec!["Utils".to_string()],
+        );
+
+        // Test get_full_name functionality for templates
+        assert_eq!(global_template.get_full_name(), "Container");
+        assert_eq!(ns_template.get_full_name(), "Utils::Container");
+
+        // Instantiate templates
+        global_template.define(vec!["int32_t".to_string()], bv.as_ref());
+        ns_template.define(vec!["int32_t".to_string()], bv.as_ref());
+
+        // Verify instantiated types have correct names
+        assert!(bv.type_id_by_name("Container<int32_t>").is_some());
+        assert!(bv.type_id_by_name("Utils::Container<int32_t>").is_some());
+
+        // They should have different sizes
+        assert_eq!(get_type_width_by_name("Container<int32_t>", &bv), Some(4)); // Just T value
+        assert_eq!(
+            get_type_width_by_name("Utils::Container<int32_t>", &bv),
+            Some(8)
+        ); // T data + int32_t size
+    }
+
+    #[test]
+    fn test_namespace_class_definitions() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define classes in different namespaces
+        let global_class = Class::new(
+            "class MyClass",
+            "MyClass();\n~MyClass();\n// ; end vtable\nint32_t value;",
+            bv.as_ref(),
+            Vec::new(),
+        );
+        global_class.define(bv.as_ref());
+
+        let ns_class = Class::new(
+            "class MyClass",
+            "MyClass();\n~MyClass();\n// ; end vtable\nint64_t data;",
+            bv.as_ref(),
+            vec!["Services".to_string()],
+        );
+        ns_class.define(bv.as_ref());
+
+        // Test get_full_name functionality for classes
+        assert_eq!(global_class.get_full_name(), "MyClass");
+        assert_eq!(ns_class.get_full_name(), "Services::MyClass");
+
+        // Verify types are defined in Binary Ninja with correct names
+        assert!(bv.type_id_by_name("MyClass").is_some());
+        assert!(bv.type_id_by_name("Services::MyClass").is_some());
+    }
+
+    #[test]
+    fn test_full_namespace_parsing() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        let namespace_code = r#"
+            namespace QQQ {
+                struct aaa {
+                    uint32_t a;
+                    void* b;
+                };
+                
+                namespace RRR {
+                    struct aaa {
+                        void* a;
+                        bool b;
+                        uint64_t c;
+                    };
+                    
+                    struct bbb {
+                        aaa a;
+                    };            
+
+                    struct ccc {
+                        QQQ::aaa a;
+                    };
+                }
+            }
+        "#;
+
+        let parser = Parser::new(bv.as_ref());
+        parser.parse(namespace_code);
+
+        // Verify all types are defined with correct namespace prefixes
+        assert!(bv.type_id_by_name("QQQ::aaa").is_some());
+        assert!(bv.type_id_by_name("QQQ::RRR::aaa").is_some());
+        assert!(bv.type_id_by_name("QQQ::RRR::bbb").is_some());
+
+        // Verify they have the expected sizes
+        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv), Some(0x10)); // uint32_t + void*
+        assert_eq!(get_type_width_by_name("QQQ::RRR::aaa", &bv), Some(0x18)); // void* + bool + padding + uint64_t
+        assert_eq!(get_type_width_by_name("QQQ::RRR::bbb", &bv), Some(0x18)); // QQQ::RRR::aaa
+        assert_eq!(get_type_width_by_name("QQQ::RRR::ccc", &bv), Some(0x10)); // QQQ::aaa
     }
 }
