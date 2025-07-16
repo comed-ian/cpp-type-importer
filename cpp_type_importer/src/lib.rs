@@ -1,6 +1,6 @@
 use binaryninja::binary_view::BinaryViewExt;
 use binaryninja::command::{register_command, Command};
-// use binaryninja::logger::Logger;
+use binaryninja::logger::Logger;
 use binaryninja::rc::Ref;
 use binaryninja::types::{
     BaseStructure, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
@@ -105,9 +105,11 @@ impl<'a> Enum {
                     current_value = assigned_value;
                 } else {
                     // Default to current_value
-                    dbg!(format!(
-                        "Warning: Could not parse enum value '{value_str}', using {current_value}"
-                    ));
+                    log::warn!(
+                        "Could not parse enum value '{}', using {}",
+                        value_str,
+                        current_value
+                    );
                 }
 
                 values.push((name, current_value));
@@ -178,7 +180,7 @@ impl<'a> Typedef {
         } else {
             Member::define_type(&self.typ, self.depth, bv)
         };
-        println!("{:?}", target_type);
+        log::info!("Got typedef target type: {}", target_type);
         bv.define_user_type(&self.name, &target_type);
         true
     }
@@ -238,7 +240,7 @@ impl<'a> Template {
             if member.trim() == "" {
                 continue;
             }
-            dbg!(&format!("Member {member}"));
+            log::debug!("Defining member: {}", member);
             // Create a new member and provide the typenames to swap in case
             // the given member uses a typename
             members.push(Member::new(
@@ -347,11 +349,11 @@ impl<'a> Structure {
             m.define(None, &mut builder, bv);
         }
         let s = Type::structure(&builder.finalize());
-        dbg!(format!(
+        log::debug!(
             "Defining {} structure {}",
             if self.packed { "(packed)" } else { "" },
             self.name
-        ));
+        );
         bv.define_user_type(&self.name, &s);
         true
     }
@@ -651,7 +653,7 @@ impl<'a> Class {
             if let Member::Function { .. } = method {
                 if let Some(override_str) = override_info {
                     // Check if this override targets the current base class
-                    dbg!(&format!("Handling override: {override_str}"));
+                    log::info!("Handling override: {}", override_str);
                     // TODO what about multiple levels of inheritance?
                     if Self::is_override_for_base_class(override_str, base_class) {
                         // Parse the override information to find the target method
@@ -726,9 +728,11 @@ impl<'a> Class {
                             }
 
                             if cleaned_override == contents {
-                                dbg!(&format!(
-                                    "Found override for '{cleaned_override}' in {base_class}",
-                                ));
+                                log::info!(
+                                    "Found override for '{}' in {}",
+                                    cleaned_override,
+                                    base_class
+                                );
                                 // Return the offset in bytes (assuming pointer size)
                                 let pointer_size = bv
                                     .default_arch()
@@ -820,9 +824,11 @@ impl<'a> Class {
                                     };
 
                                 if cleaned_override == check_against {
-                                    dbg!(&format!(
-                                        "Found member override '{cleaned_override}' in base class '{base_class}'",
-                                    ));
+                                    log::info!(
+                                        "Found member override '{}' in base class '{}'",
+                                        cleaned_override,
+                                        base_class
+                                    );
                                     return Some((base_class.clone(), member.offset));
                                 }
                             }
@@ -1110,7 +1116,7 @@ impl<'a> Member {
     /// # Returns
     /// Binary Ninja type reference for the defined type
     fn define_type(t: &str, depth: u8, bv: &BinaryView) -> Ref<Type> {
-        dbg!(&format!("Defining type {t}"));
+        log::debug!("Defining type: {}", t);
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
@@ -1165,9 +1171,12 @@ impl<'a> Member {
     ) -> Self {
         let (typ, name, depth) =
             parse_member_definition(def).expect("Could not parse member definition");
-        dbg!(format!(
-            "Got member definition type={typ}, name={name}, depth={depth}"
-        ));
+        log::info!(
+            "Got member definition type={}, name={}, depth={}",
+            typ,
+            name,
+            depth
+        );
         if let Some(_) = is_primitive(&typ) {
             let typ = Self::define_type(&typ, depth, bv);
             return Member::Basic {
@@ -1191,7 +1200,7 @@ impl<'a> Member {
 
                 // Reconstruct the type string with substituted parameters
                 def = tokens.join("");
-                dbg!(&format!("Instantitated templated type {def}"));
+                log::info!("Instantiated templated type: {}", def);
             }
             // Try to match function definition: `return_type (*name)(args)`
             let func_regex = Regex::new(r"(.*) \(\*(.*)\)\((.*)\)").unwrap();
@@ -1200,10 +1209,12 @@ impl<'a> Member {
                 let name = captures.get(2).unwrap().as_str().trim();
                 let args = captures.get(3).unwrap().as_str().trim();
 
-                dbg!(format!(
-                    "Got function definition: return_type={}, name={}, args={:#}",
-                    return_type, name, args
-                ));
+                log::info!(
+                    "Got function definition: return_type={}, name={}, args={:?}",
+                    return_type,
+                    name,
+                    args
+                );
                 let (return_type, _, depth) = parse_member_definition(return_type)
                     .expect("Could not parse function member return type");
                 let args = parse_template_instantiation(args)
@@ -1246,7 +1257,7 @@ impl<'a> Member {
                 comments: _,
             } => {
                 // Simply append basic members
-                dbg!(&format!("Adding member: {name}"));
+                log::debug!("Adding member: {}", name);
                 if let Some(o) = offset {
                     builder.insert(
                         typ.as_ref(),
@@ -1267,7 +1278,7 @@ impl<'a> Member {
             }
             Member::Function { name, ret, args } => {
                 // Create a function type and pointer to that function
-                dbg!(&format!("Adding function: {name}"));
+                log::debug!("Adding function: {}", name);
                 let mut v = vec![];
                 for (arg_name, arg_type) in args {
                     v.push(FunctionParameter::new(
@@ -1624,7 +1635,7 @@ impl<'a> Parser<'a> {
             if let Some((i, c, mut s)) = find_next_token(&contents[idx..]) {
                 s = s.trim();
                 idx += i + 1;
-                dbg!(format!("{i}, {s}, {c}"));
+                log::info!("Handling line: {}, {}, {}", i, s, c);
                 // base case
                 if i == 0 {
                     continue;
@@ -1637,7 +1648,7 @@ impl<'a> Parser<'a> {
                     s2 = s2.trim();
                     // throw out include statements
                     assert!(c == '<' || c == '"');
-                    dbg!(format!("Skipping {s} {s2}"));
+                    log::info!("Skipping line: {} {}", s, s2);
                     idx += i2 + 1;
                     continue;
                 }
@@ -1649,21 +1660,19 @@ impl<'a> Parser<'a> {
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
                             // template definition, store for later declarations
-                            dbg!(format!("Got template type {s2}"));
+                            log::info!("Got template type: {}", s2);
                             let typenames = parse_template_definition(s2)
                                 .expect(&format!("Could not parse template definitions {s2}"));
                             let (i3, c3, s3) = find_next_token(&contents[idx + i2 + 1..])
                                 .expect("Could not find closing token for template definition");
                             assert!(c3 == '{');
-                            dbg!(format!("{typenames:?}"));
-                            dbg!(format!("Got template name {s3}"));
+                            log::info!("Got template name: {}", s3);
                             let (i4, _, body) =
                                 find_closing_token(&contents[idx + i2 + i3 + 2..], c3)
                                     .expect("Could not find closing token");
-                            dbg!(format!("Got template definition {body}"));
+                            log::info!("Got template definition: {}", body);
                             idx += i3 + i4 + 2;
                             let t = Template::new(s3, body, typenames);
-                            println!("{:?}", t);
                             templates.push(t);
                             idx += i2 + 1;
                         } else {
@@ -1675,18 +1684,17 @@ impl<'a> Parser<'a> {
                                 let mut typedef_string = s[8..].to_string();
                                 typedef_string.push('<');
                                 typedef_string.push_str(&s2);
-                                println!("Got typedef string: {typedef_string}");
+                                log::info!("Got typedef string: {}", typedef_string);
                                 let t = Typedef::new(&typedef_string);
                                 t.define(self.bv);
                             } else {
-                                println!("{s} {s2}");
+                                log::info!("Handling line: {} {}", s, s2);
                                 if let Some(stripped) = s2.strip_suffix('>') {
                                     s2 = stripped;
                                 }
-                                dbg!(format!("Got template instantiation {s2}"));
+                                log::info!("Got template instantiation: {}", s2);
                                 let typenames = parse_template_instantiation(s2)
                                     .expect(&format!("Could not parse template definitions {s2}"));
-                                dbg!(format!("{typenames:?}"));
                                 // check for template named `s` to declare
                                 let t = templates
                                     .iter()
@@ -1708,7 +1716,7 @@ impl<'a> Parser<'a> {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
-                            dbg!(format!("Got forward declaration {s2}"));
+                            log::info!("Got forward declaration {}", s2);
                             idx += i2 + 1;
                         }
                     }
@@ -1718,24 +1726,16 @@ impl<'a> Parser<'a> {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
-                            dbg!("Got struct");
-                            dbg!(format!("{s}: {s2}"));
+                            log::info!("Got struct {}: {}", s, s2);
                             let mut structure = Structure::new(s, s2, self.bv);
-                            dbg!(format!("{structure:?}",));
                             structure.define(self.bv);
                             idx += i2 + 1;
-
-                            // for l in s2.lines() {
-                            //     dbg!(format!("Got Member {:#?}", Member::parse(l, vec![])));
-                            // }
                         } else if s.starts_with("class") {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
-                            dbg!("Got class");
-                            dbg!(format!("{s}: {s2}"));
+                            log::debug!("Got class {}: {}", s, s2);
                             let class = Class::new(s, s2, self.bv);
-                            dbg!(format!("{class:?}"));
                             class.define(self.bv);
                             idx += i2 + 1;
                         } else if s.starts_with("enum") {
@@ -1769,7 +1769,7 @@ impl<'a> Parser<'a> {
                                     panic!("Could not parse enum definition: {s}");
                                 };
 
-                            dbg!(format!("Got enum {enum_name} with size {size}"));
+                            log::info!("Got enum {} with size {}", enum_name, size);
                             let enum_def = Enum::new(enum_name, size, s2);
                             enum_def.define(self.bv);
 
@@ -1851,7 +1851,9 @@ impl Command for ImportCppTypesCommand {
 #[no_mangle]
 pub extern "C" fn CorePluginInit() -> bool {
     // Initialize logging
-    log::set_max_level(LevelFilter::Debug);
+    Logger::new("C++ Type Importer")
+        .with_level(LevelFilter::Info)
+        .init();
 
     // Register the C++ Type Importer command
     register_command(
@@ -1884,7 +1886,6 @@ mod tests {
         path.push("../test.hpp");
         save_path.push("test.bndb");
         // get temp bv for arch
-        println!("{save_path:?}");
         let headless_session = Session::new().expect("Failed to initialize session");
         let bv = headless_session.load(&save_path).expect("Couldn't open bv");
         let mut file = File::open(&path).expect("Could not open test file");
