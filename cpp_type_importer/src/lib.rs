@@ -1795,7 +1795,7 @@ impl<'a> Parser<'a> {
                 idx += i + 1;
                 log::info!("Handling line: {}, {}, {}", i, s, c);
                 // base case
-                if i == 0 {
+                if i == 0 || s.starts_with("//") {
                     continue;
                 }
                 // structure, template, class definition
