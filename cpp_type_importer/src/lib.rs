@@ -1,3 +1,4 @@
+use binaryninja::binary_view::BinaryView;
 use binaryninja::binary_view::BinaryViewExt;
 use binaryninja::command::{register_command, Command};
 use binaryninja::logger::Logger;
@@ -6,7 +7,6 @@ use binaryninja::types::{
     BaseStructure, EnumerationBuilder, FunctionParameter, MemberAccess, MemberScope,
     NamedTypeReference, NamedTypeReferenceClass, StructureBuilder, Type,
 };
-use binaryninja::{architecture::Architecture, binary_view::BinaryView};
 use log::{error, info, LevelFilter};
 use regex::Regex;
 use std::fs::File;
@@ -17,6 +17,8 @@ use std::path::PathBuf;
 // 1. Multi-level inheritance
 // 2. Templated Typedefs
 // 3. Conflicting vtable function names (e.g., MyMethod)
+// 4. Structure offsets
+// 5. Arrays
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -33,13 +35,15 @@ fn is_primitive(s: &str) -> Option<Ref<Type>> {
         "int8_t" => Some(Type::int(1, true)),
         "uint8_t" => Some(Type::int(1, false)),
         "int16_t" => Some(Type::int(2, true)),
-        "uint16_t" => Some(Type::int(3, false)),
+        "uint16_t" => Some(Type::int(2, false)),
         "int32_t" => Some(Type::int(4, true)),
         "uint32_t" => Some(Type::int(4, false)),
         "int" => Some(Type::int(4, true)),
         "unsigned int" => Some(Type::int(4, false)),
         "int64_t" => Some(Type::int(8, true)),
         "uint64_t" => Some(Type::int(8, false)),
+        "float" => Some(Type::int(4, true)),
+        "double" => Some(Type::int(8, true)),
         "bool" => Some(Type::bool()),
         "void" => Some(Type::void()),
         _ => None,
@@ -53,6 +57,30 @@ pub fn get_type_width_by_name(name: &str, bv: &BinaryView) -> Option<u64> {
     // if it was a defined structure.
     let typ = bv.type_by_id(&id)?;
     Some(typ.width())
+}
+
+pub fn get_type_by_name(name: &str, bv: &BinaryView) -> Option<Ref<Type>> {
+    let id = bv.type_id_by_name(name)?;
+    bv.type_by_id(&id)
+}
+
+pub fn get_non_primitive_type_by_name(name: &str, bv: &BinaryView) -> Option<Ref<Type>> {
+    let type_id = bv.type_id_by_name(name)?;
+    let named_ref = NamedTypeReference::new_with_id(
+        NamedTypeReferenceClass::StructNamedTypeClass,
+        &type_id,
+        name,
+    );
+    // Hack: `Type::named_type(&named_ref)` always returns
+    // a reference with width 0, making any member structs
+    // (that are not pointers to structs) appear with 0 size.
+    // Workaround using `Type::named_type_from_type` after
+    // fetching the type with `type_by_ref` using the reference
+    // above
+    Some(Type::named_type_from_type(
+        named_ref.name(),
+        bv.type_by_ref(&named_ref)?.as_ref(),
+    ))
 }
 
 /// Represents a C++ enum with values and size specification
@@ -457,25 +485,34 @@ impl<'a> Class {
         // TODO parse inherited classes differently, inherited classes could be templated
         let class_regex = Regex::new(r"class\s+(\w+)(?:\s*:\s*(.+))?").unwrap();
         let (name, base_classes) = if let Some(captures) = class_regex.captures(def) {
-            let class_name = captures.get(1).unwrap().as_str().to_string();
-            let base_classes = if let Some(inheritance) = captures.get(2) {
-                // Parse inherited classes (split by comma or space)
-                inheritance
-                    .as_str()
-                    .split_whitespace()
-                    .filter(|s| {
-                        !s.is_empty() && *s != "public" && *s != "private" && *s != "protected"
-                    })
-                    .map(|s| s.trim_end_matches(',').to_string())
-                    .collect()
+            if let Some(class_name) = captures.get(1) {
+                let class_name = class_name.as_str().to_string();
+                let base_classes = if let Some(inheritance) = captures.get(2) {
+                    // Parse inherited classes (split by comma or space)
+                    inheritance
+                        .as_str()
+                        .split_whitespace()
+                        .filter(|s| {
+                            !s.is_empty() && *s != "public" && *s != "private" && *s != "protected"
+                        })
+                        .map(|s| s.trim_end_matches(',').to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (class_name, base_classes)
             } else {
-                Vec::new()
-            };
-            (class_name, base_classes)
+                log::error!("Could not find class name in {def}");
+                ("".to_string(), vec![])
+            }
         } else {
             // Fallback to existing `parse_name` logic
-            let name = parse_name(def).expect(&format!("Could not parse class name from {def}"));
-            (name, Vec::new())
+            if let Some(name) = parse_name(def) {
+                (name, Vec::new())
+            } else {
+                log::error!("Could not parse class name from {def}");
+                ("".to_string(), Vec::new())
+            }
         };
 
         // Forward-declare the class as a structure so it can be referenced in constructor signatures
@@ -516,7 +553,12 @@ impl<'a> Class {
                 // TODO include offset information in this
                 let override_regex = Regex::new(r"//\s*;\s*override\s+(.+?);").unwrap();
                 let override_info = if let Some(captures) = override_regex.captures(line) {
-                    Some(captures.get(1).unwrap().as_str().to_string())
+                    if let Some(cap) = captures.get(1) {
+                        Some(cap.as_str().to_string())
+                    } else {
+                        log::warn!("Could not find first regex capture group for override");
+                        None
+                    }
                 } else {
                     None
                 };
@@ -713,35 +755,60 @@ impl<'a> Class {
     /// # Arguments
     /// * `vtable_methods` - List of virtual table methods
     /// * `vtable_builder` - Structure builder for the virtual table
-    /// * `base_class` - The base class name
+    /// * `base_class` - The base class vtable name (e.g., `HHH_vtable_III` or `JJJ_vtable`)
     /// * `process_non_overriding` - Whether to process non-overriding methods
     /// * `bv` - Binary Ninja binary view reference
     fn process_vtable_methods_for_base(
-        vtable_methods: &[(Member, Option<String>)],
+        &mut self,
         vtable_builder: &mut StructureBuilder,
-        base_class: &str,
+        base_class_vtable_name: &str,
         process_non_overriding: bool,
         bv: &'a BinaryView,
     ) {
-        for (method, override_info) in vtable_methods {
-            // TODO move this to Member::define
+        let mut remaining: Vec<(Member, Option<String>)> = vec![];
+        for (method, override_info) in &self.vtable_methods {
             if let Member::Function { .. } = method {
                 if let Some(override_str) = override_info {
                     // Check if this override targets the current base class
-                    log::info!("Handling override: {}", override_str);
-                    // TODO what about multiple levels of inheritance?
-                    if Self::is_override_for_base_class(override_str, base_class) {
+                    log::info!("Checking override: {}", override_str);
+                    if override_str.contains(base_class_vtable_name) {
                         // Parse the override information to find the target method
                         if let Some(offset) =
-                            Self::parse_override_offset(override_str, base_class, bv)
+                            Self::parse_override_offset(&override_str, base_class_vtable_name, bv)
                         {
                             // Override at specific offset
                             method.define(Some(offset), vtable_builder, bv);
+                            continue;
                         }
                     }
+                    remaining.push((method.clone(), Some(override_str.clone())));
                 } else if process_non_overriding {
                     // No override, add to vtable only if processing non-overriding methods
                     method.define(None, vtable_builder, bv);
+                } else {
+                    remaining.push((method.clone(), override_info.clone()));
+                }
+            }
+        }
+
+        self.vtable_methods = remaining;
+
+        // If the vtable inherits from another vtable, try seraching downward to
+        // see if any of the base classes match. E.g., if D : C : B and C does not
+        // override a function from B, it will still have `B::function_name` in its
+        // vtable. Therefore, need to search B's vtable after trying C's.
+        if let Some(base_vtable_type_id) = bv.type_id_by_name(base_class_vtable_name) {
+            if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
+                if let Some(s) = base_vtable_type.get_structure() {
+                    // Vtables should only inherit from one structure
+                    if let Some(b) = s.base_structures().first() {
+                        self.process_vtable_methods_for_base(
+                            vtable_builder,
+                            &b.ty.name().to_string(),
+                            false, // Already added to the structure builder, don't add again
+                            bv,
+                        );
+                    }
                 }
             }
         }
@@ -757,11 +824,13 @@ impl<'a> Class {
     /// # Returns
     /// `true` if the override targets the base class
     /// TODO what about multiple levels of inheritance
-    fn is_override_for_base_class(override_str: &str, base_class: &str) -> bool {
-        // Check if the override string contains the base class vtable name
-        let base_vtable_name = format!("{}_vtable", base_class);
-        override_str.contains(&base_vtable_name)
-    }
+    // fn is_override_for_base_class(override_str: &str, base_class: &str) -> bool {
+    //     // Check if the override string contains the base class vtable name
+    //     let base_vtable_name = format!("{}_vtable", base_class);
+    //     let base_vtable_name_inherited = format!("vtable_{}", base_class);
+    //     override_str.contains(&base_vtable_name)
+    //         || override_str.contains(&base_vtable_name_inherited)
+    // }
 
     /// Parses the offset for a method override in a base class virtual table
     ///
@@ -774,15 +843,12 @@ impl<'a> Class {
     /// `Some(u64)` with the offset if found, `None` otherwise
     fn parse_override_offset(
         override_str: &str,
-        base_class: &str,
+        base_vtable_name: &str,
         bv: &'a BinaryView,
     ) -> Option<u64> {
-        // Parse override string like `void (* base_vtable::fn)(struct base* this);`
-        // Look for the base class vtable and method name
-        let base_vtable_name = format!("{}_vtable", base_class);
-
+        // Parse override string like `void (* <base_vtable_name>::fn)(struct base* this);`
         // Find the vtable type and look for the method
-        if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
+        if let Some(base_vtable_type_id) = bv.type_id_by_name(base_vtable_name) {
             if let Some(base_vtable_type) = bv.type_by_id(&base_vtable_type_id) {
                 // Get the structure members to find the method offset
                 if let Some(structure) = base_vtable_type.get_structure() {
@@ -792,7 +858,7 @@ impl<'a> Class {
                         Self::extract_method_name_from_override(override_str)
                     {
                         // Find the method in the base vtable structure by reconstructing the signature
-                        for (i, member) in structure.members().iter().enumerate() {
+                        for member in structure.members().iter() {
                             // Get member type contents, which does not include the function name,
                             // just the return value, `(*)`, and arguments
                             let mut contents = member.ty.contents.to_string();
@@ -804,16 +870,12 @@ impl<'a> Class {
 
                             if cleaned_override == contents {
                                 log::info!(
-                                    "Found override for '{}' in {}",
+                                    "Found override for '{}' in {} at offset 0x{:x}",
                                     cleaned_override,
-                                    base_class
+                                    base_vtable_name,
+                                    member.offset
                                 );
-                                // Return the offset in bytes (assuming pointer size)
-                                let pointer_size = bv
-                                    .default_arch()
-                                    .expect("Could not find default arch")
-                                    .address_size();
-                                return Some((i as u64) * (pointer_size as u64));
+                                return Some(member.offset);
                             }
                         }
                     }
@@ -827,16 +889,16 @@ impl<'a> Class {
     ///
     /// # Arguments
     /// * `override_str` - The override specification string, like
-    /// `void (* base_vtable::fn)(struct base* this)`
+    /// `void (* HHH_vtable_III::fn)(struct base* this)` or
+    /// `void (* JJJ_vtable::fn)(struct base* this)`
     ///
     /// # Returns
     /// `Some(String)` with the cleaned method name (e.g., `void (* fn)(struct base* this)`),
     /// `None` if parsing fails
-    /// TODO what about mutli-level vtables
     fn extract_method_name_from_override(override_str: &str) -> Option<String> {
         // Parse override string like `void (* base_vtable::fn)(struct base* this);`
         // Remove the inherited `base_vtable::` prefix while keeping the rest
-        let regex = Regex::new(r"\w+_vtable::").unwrap();
+        let regex = Regex::new(r"\w+_vtable(\w+)?::").unwrap();
         let cleaned = regex.replace_all(override_str, "");
         Some(cleaned.to_string())
     }
@@ -861,18 +923,18 @@ impl<'a> Class {
     ///
     /// # Arguments
     /// * `override_str` - The override specification string
-    /// * `base_classes` - List of base class names
+    /// * `base_classes` - List of base class names and their respective offsets
     /// * `bv` - Binary Ninja binary view reference
     ///
     /// # Returns
     /// `Some((String, u64))` with base class name and offset if found
     fn parse_member_override_offset(
         override_str: &str,
-        base_classes: &[String],
+        base_classes: &[(String, u64)],
         bv: &'a BinaryView,
     ) -> Option<(String, u64)> {
         // Try to find the member in each base class
-        for base_class in base_classes {
+        for (base_class, base_offset) in base_classes {
             if let Some(cleaned_override) =
                 Self::extract_member_from_override(override_str, base_class)
             {
@@ -900,11 +962,12 @@ impl<'a> Class {
 
                                 if cleaned_override == check_against {
                                     log::info!(
-                                        "Found member override '{}' in base class '{}'",
+                                        "Found member override '{}' in base class '{}' at offset {}+{base_offset}",
                                         cleaned_override,
-                                        base_class
+                                        base_class,
+                                        member.offset
                                     );
-                                    return Some((base_class.clone(), member.offset));
+                                    return Some((base_class.clone(), member.offset + base_offset));
                                 }
                             }
                         }
@@ -915,6 +978,103 @@ impl<'a> Class {
         None
     }
 
+    /// Recursively collects all base classes for this class, including indirect inheritance
+    ///
+    /// # Arguments
+    /// * `bv` - Binary Ninja binary view reference
+    ///
+    /// # Returns
+    /// A vector of tuples (base_class_name, offset) for all base classes
+    fn collect_all_base_classes(&self, bv: &'a BinaryView) -> Vec<(String, u64)> {
+        let mut all_bases = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        // Depth-first search to collect all base classes with their offsets
+        fn collect_recursive(
+            override_vtable: bool,
+            base_class: &str,
+            current_offset: u64,
+            all_bases: &mut Vec<(String, u64)>,
+            visited: &mut std::collections::HashSet<String>,
+            bv: &BinaryView,
+        ) -> u64 {
+            if visited.contains(base_class) {
+                return current_offset;
+            }
+
+            visited.insert(base_class.to_string());
+            // Used to differentiate vtable overwrites. E.g, consider
+            // A : B, C and B : D, E and C : F, G, H. A should overwrite
+            // vtables for B and C (top level, which override D and F),
+            // B's overriden vtable for E and C's overriden vtable for G.
+            // We need to keep track of all inherited base classes for overriding
+            // functionality not touched in the middle classes (B, C), and thus
+            // need to track that A still inherits members and potentially vtable
+            // methods from D, E, F, G, and H. However, only the top level vtables
+            // (B and C) and the `1..` inherited base class vtables (E, G, H) are
+            // overridden. The first inherited class in each top-level class (D, F)
+            // are stored with offset `u64::MAX` to indicate A does not override
+            // their vtables.
+            // if override_vtable {
+            // } else {
+            //     all_bases.push((base_class.to_string(), std::u64::MAX));
+            // }
+            all_bases.push((base_class.to_string(), current_offset));
+            let mut updated_offset = current_offset;
+
+            // Look up the base class type in Binary Ninja
+            if let Some(base_type_id) = bv.type_id_by_name(base_class) {
+                if let Some(base_type) = bv.type_by_id(&base_type_id) {
+                    if let Some(base_structure) = base_type.get_structure() {
+                        // Recursively collect base structures of this base class
+                        for (i, base_struct) in base_structure.base_structures().iter().enumerate()
+                        {
+                            let override_vtable = if i != 0 { true } else { false };
+                            let indirect_base_name = base_struct.ty.name().to_string();
+                            updated_offset = collect_recursive(
+                                override_vtable,
+                                &indirect_base_name,
+                                updated_offset,
+                                all_bases,
+                                visited,
+                                bv,
+                            );
+                        }
+                        // Increment offset by the width of this base class if this
+                        // child has no children.
+                        if base_structure.base_structures().is_empty() {
+                            if let Some(width) = get_type_width_by_name(&base_class, bv) {
+                                return current_offset + width;
+                            }
+                        }
+                    }
+                }
+            }
+            updated_offset
+        }
+
+        // Start DFS from each direct base class
+        let mut current_offset = 0u64;
+        for base_class in &self.base_classes {
+            collect_recursive(
+                true,
+                base_class,
+                current_offset,
+                &mut all_bases,
+                &mut visited,
+                bv,
+            );
+
+            // Increment offset by the width of this direct base class
+            if let Some(width) = get_type_width_by_name(base_class, bv) {
+                current_offset += width;
+            }
+        }
+
+        log::info!("Found all bases {:#x?}", all_bases);
+        all_bases
+    }
+
     /// Defines the class and its virtual tables in Binary Ninja's type system
     ///
     /// # Arguments
@@ -922,8 +1082,9 @@ impl<'a> Class {
     ///
     /// # Returns
     /// `true` if the class was successfully defined
-    pub fn define(&self, bv: &'a BinaryView) -> bool {
+    pub fn define(&mut self, bv: &'a BinaryView) -> bool {
         // Create separate vtables for overriding each base class's
+        // Tuple of (new_vtable_name, inherited_vtable_name, offset)
         let mut vtable_names = Vec::new();
 
         if self.base_classes.is_empty() {
@@ -937,28 +1098,83 @@ impl<'a> Class {
                 }
             }
 
+            self.vtable_methods = vec![];
+
             let vtable_structure = Type::structure(&vtable_builder.finalize());
             bv.define_user_type(&vtable_name, &vtable_structure);
-            vtable_names.push(vtable_name);
+            vtable_names.push((vtable_name, 0));
         } else {
-            // Has inheritance - create vtables for each base class
-            for (i, base_class) in self.base_classes.iter().enumerate() {
-                let vtable_name = format!("{}_vtable_{}", self.name, base_class);
-                let base_vtable_name = format!("{}_vtable", base_class);
+            // Has inheritance - collect all non-top-level base classes. Top-level
+            // parent classes are handled next.
+            let all_base_classes: Vec<(String, u64)> = self
+                .collect_all_base_classes(bv)
+                .into_iter()
+                .filter(|(name, _)| !self.base_classes.contains(name))
+                .collect::<_>();
 
+            log::info!("{:#x?}", all_base_classes);
+
+            // Iterate over top-level parents, finding any inherited classes
+            let mut vtable_names_and_offsets = vec![];
+            let mut current_offset = 0u64;
+            for top_level_base in self.base_classes.iter() {
+                let width = get_type_width_by_name(top_level_base, bv)
+                    .expect(&format!("Could not find width for {}", top_level_base));
+
+                // Check if there are any inherited classes at top-level parent class's offset.
+                // If not, this parent does not inherit from other classes. Make the inherited
+                // vtable name simply <parent_name>_vtable. Otherwise, the inherited name is the
+                // <child_name>_vtable_<parent_name>
+                match all_base_classes
+                    .iter()
+                    .find(|(_, off)| *off == current_offset)
+                {
+                    None => vtable_names_and_offsets.push((
+                        format!("{}_vtable_{top_level_base}", self.name),
+                        format!("{top_level_base}_vtable"),
+                        current_offset,
+                    )),
+                    Some(parent_name) => vtable_names_and_offsets.push((
+                        format!("{}_vtable_{}", self.name, top_level_base),
+                        format!("{top_level_base}_vtable_{}", parent_name.0),
+                        current_offset,
+                    )),
+                }
+
+                for (base, off) in all_base_classes
+                    .iter()
+                    .filter(|(_, off)| *off > current_offset && *off < current_offset + width)
+                {
+                    vtable_names_and_offsets.push((
+                        format!("{}_vtable_{base}", self.name),
+                        format!("{top_level_base}_vtable_{base}"),
+                        *off,
+                    ));
+                }
+                current_offset += width;
+            }
+
+            log::info!(
+                "Got inherited class vtable_names_and_offsets {:#x?}",
+                vtable_names_and_offsets
+            );
+
+            for (i, (new_vtable_name, inherited_vtable_name, offset)) in
+                vtable_names_and_offsets.iter().enumerate()
+            {
                 let mut vtable_builder = StructureBuilder::new();
 
                 // Add base class vtable as base structure and set proper width
                 let mut base_vtable_width = 0u64;
-                if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
+                if let Some(base_vtable_type_id) = bv.type_id_by_name(inherited_vtable_name) {
                     let base_vtable_ref = NamedTypeReference::new_with_id(
                         NamedTypeReferenceClass::StructNamedTypeClass,
                         &base_vtable_type_id,
-                        &base_vtable_name,
+                        inherited_vtable_name,
                     );
 
                     // Get the width of the base vtable.
-                    if let Some(width) = get_type_width_by_name(&base_vtable_name, bv) {
+                    if let Some(width) = get_type_width_by_name(&inherited_vtable_name, bv) {
                         base_vtable_width = width;
                     }
 
@@ -972,20 +1188,94 @@ impl<'a> Class {
 
                 // Process vtable methods for this base class. Handles overrides and adding
                 // the class-specific methods to the vtable if this is the first base class
-                Self::process_vtable_methods_for_base(
-                    &self.vtable_methods,
+                self.process_vtable_methods_for_base(
                     &mut vtable_builder,
-                    base_class,
+                    &inherited_vtable_name,
                     i == 0, // Only process methods for the first base class
                     bv,
                 );
 
                 // Define the inherited vtable structure
                 let vtable_structure = Type::structure(&vtable_builder.finalize());
-                bv.define_user_type(&vtable_name, &vtable_structure);
-                vtable_names.push(vtable_name);
+                bv.define_user_type(new_vtable_name, &vtable_structure);
+                vtable_names.push((new_vtable_name.clone(), *offset));
             }
+            if !self.vtable_methods.is_empty() {
+                self.vtable_methods.iter().for_each(|x| {
+                    log::warn!(
+                        "Failed to define vtable method: {}::{}, override {:?}",
+                        self.name,
+                        x.0.name(),
+                        x.1
+                    );
+                })
+            }
+
+            // Create vtables for each base class (including indirect inheritance)
+            // for (i, (base_class, _offset)) in all_base_classes.iter().enumerate() {
+            //     // let base_vtable_name = if !self.base_classes.contains(base_class) {
+            //     //     // If this is a parent of a parent, override the top-level
+            //     //     // parent vtable's override of _its_ parent.
+            //     //     if let Some(inherited) = all_base_classes[0..=i]
+            //     //         .iter()
+            //     //         .rev()
+            //     //         .find(|(_, off)| *off != u64::MAX)
+            //     //     {
+            //     //         format!("{}_vtable_{}", self.name, inherited.0)
+            //     //     } else {
+            //     //         "".to_string()
+            //     //     }
+            //     // } else {
+            //     //     format!("{}_vtable", base_class)
+            //     // };
+            //     // if base_vtable_name.is_empty() {
+            //     //     continue;
+            //     // }
+            //     let vtable_name = format!("{}_vtable_{}", self.name, base_class);
+            //     let base_vtable_name = format!("{}_vtable", base_class);
+
+            //     let mut vtable_builder = StructureBuilder::new();
+
+            //     // Add base class vtable as base structure and set proper width
+            //     let mut base_vtable_width = 0u64;
+            //     if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
+            //         let base_vtable_ref = NamedTypeReference::new_with_id(
+            //             NamedTypeReferenceClass::StructNamedTypeClass,
+            //             &base_vtable_type_id,
+            //             &base_vtable_name,
+            //         );
+
+            //         // Get the width of the base vtable.
+            //         if let Some(width) = get_type_width_by_name(&base_vtable_name, bv) {
+            //             base_vtable_width = width;
+            //         }
+
+            //         // Set the base structure in the new vtable
+            //         let base_struct = BaseStructure::new(base_vtable_ref, 0, base_vtable_width);
+            //         vtable_builder.base_structures(&[base_struct]);
+
+            //         // Set the vtable builder width to account for the base vtable
+            //         vtable_builder.width(base_vtable_width);
+            //     }
+
+            //     // Process vtable methods for this base class. Handles overrides and adding
+            //     // the class-specific methods to the vtable if this is the first base class
+            //     Self::process_vtable_methods_for_base(
+            //         &self.vtable_methods,
+            //         &mut vtable_builder,
+            //         base_class,
+            //         i == 0, // Only process methods for the first base class
+            //         bv,
+            //     );
+
+            //     // Define the inherited vtable structure
+            //     let vtable_structure = Type::structure(&vtable_builder.finalize());
+            //     bv.define_user_type(&vtable_name, &vtable_structure);
+            //     vtable_names.push(vtable_name);
+            // }
         }
+
+        log::info!("Got vtable names and offsets: {:#x?}", vtable_names);
 
         // Now create the main class structure
         let mut class_builder = StructureBuilder::new();
@@ -1019,80 +1309,80 @@ impl<'a> Class {
             class_builder.width(cumulative_width);
         }
 
-        // Step 2: Override base class vtables
-        if !self.base_classes.is_empty() {
-            let mut current_offset = 0;
+        // Step 2: Insert vtables.
+        // This includes overriding inherited class vtables (including indirect inheritance)
+        // if !self.base_classes.is_empty() {
+        // let all_base_classes = self.collect_all_base_classes(bv);
 
-            for (i, base_class) in self.base_classes.iter().enumerate() {
-                if let Some(vtable_name) = vtable_names.get(i) {
-                    // Create vtable pointer
-                    let vtable_ptr = Type::pointer(
-                        &bv.default_arch().expect("Could not find default arch"),
-                        &Type::named_type(&NamedTypeReference::new(
-                            NamedTypeReferenceClass::StructNamedTypeClass,
-                            vtable_name,
-                        )),
-                    );
+        // for (i, (base_class, offset)) in all_base_classes.iter().enumerate() {
+        for (vtable_name, offset) in vtable_names {
+            // if let Some(vtable_name) = vtable_names.get(i) {
+            // Create vtable pointer
+            let vtable_ptr = Type::pointer(
+                &bv.default_arch().expect("Could not find default arch"),
+                &Type::named_type(&NamedTypeReference::new(
+                    NamedTypeReferenceClass::StructNamedTypeClass,
+                    &vtable_name,
+                )),
+            );
 
-                    // Insert vtable at the start of this base class (current_offset)
-                    let vtable_member_name = format!("vtable_{}", base_class);
-                    class_builder.insert(
-                        vtable_ptr.as_ref(),
-                        &vtable_member_name,
-                        current_offset,
-                        true, // overwrite existing
-                        MemberAccess::PublicAccess,
-                        MemberScope::NoScope,
-                    );
-
-                    // Update offset for next base class using the actual size/width
-                    if let Some(width) = get_type_width_by_name(&base_class, bv) {
-                        current_offset += width;
-                    }
-                }
-            }
-        } else if !self.vtable_methods.is_empty() {
-            // Regular class with vtable - insert at offset 0
-            if let Some(vtable_name) = vtable_names.get(0) {
-                let vtable_ptr = Type::pointer(
-                    &bv.default_arch().expect("Could not find default arch"),
-                    &Type::named_type(&NamedTypeReference::new(
-                        NamedTypeReferenceClass::StructNamedTypeClass,
-                        vtable_name,
-                    )),
-                );
-                class_builder.insert(
-                    vtable_ptr.as_ref(),
-                    "vtable",
-                    0,
-                    true, // overwrite existing
-                    MemberAccess::PublicAccess,
-                    MemberScope::NoScope,
-                );
-            }
+            let vtable_member_name = match vtable_name.find("_vtable") {
+                Some(pos) => &vtable_name[pos + 1..],
+                None => &vtable_name[..],
+            };
+            // Insert vtable at the correct offset for this base class
+            class_builder.insert(
+                vtable_ptr.as_ref(),
+                &vtable_member_name,
+                offset,
+                true, // overwrite existing
+                MemberAccess::PublicAccess,
+                MemberScope::NoScope,
+            );
+            // }
         }
+        // } else if !self.vtable_methods.is_empty() {
+        //     // Regular class with vtable - insert at offset 0
+        //     if let Some(vtable_name) = vtable_names.get(0) {
+        //         let vtable_ptr = Type::pointer(
+        //             &bv.default_arch().expect("Could not find default arch"),
+        //             &Type::named_type(&NamedTypeReference::new(
+        //                 NamedTypeReferenceClass::StructNamedTypeClass,
+        //                 vtable_name,
+        //             )),
+        //         );
+        //         class_builder.insert(
+        //             vtable_ptr.as_ref(),
+        //             "vtable",
+        //             0,
+        //             true, // overwrite existing
+        //             MemberAccess::PublicAccess,
+        //             MemberScope::NoScope,
+        //         );
+        //     }
+        // }
 
         // Step 3: Handle member variable overrides and add member variables specific to this class
+        let all_base_classes = self.collect_all_base_classes(bv);
         for (member, override_info) in &self.member_variables {
             if let Some(override_str) = override_info {
                 // This member overrides a base class member
-                if let Some((base_class, base_offset)) =
-                    Self::parse_member_override_offset(override_str, &self.base_classes, bv)
+                // Look for the base class in all collected base classes (including indirect ones)
+                if let Some((_, base_offset)) =
+                    Self::parse_member_override_offset(override_str, &all_base_classes, bv)
                 {
-                    // Calculate the actual offset by adding the base class offset
-                    let mut actual_offset = base_offset;
-                    for base in self.base_classes.iter() {
-                        if base == &base_class {
-                            break;
-                        }
-                        // Add the size of previous base classes
-                        if let Some(width) = get_type_width_by_name(&base, bv) {
-                            actual_offset += width;
-                        }
-                    }
+                    // Find the offset of this base class in the collected base classes
+                    // let mut actual_offset = base_offset;
+                    // for (collected_base, collected_offset) in &all_base_classes {
+                    //     if collected_base == &base_class {
+                    //         actual_offset += collected_offset;
+                    //         break;
+                    //     }
+                    // }
+                    log::debug!("Found override for {override_str} at offset {base_offset:x}");
 
                     // Insert the overriding member at the calculated offset
-                    member.define(Some(actual_offset), &mut class_builder, bv);
+                    member.define(Some(base_offset), &mut class_builder, bv);
                     continue;
                 }
             }
@@ -1123,7 +1413,7 @@ impl<'a> Class {
 ///
 /// This enum covers basic data members, function pointers, and template members
 /// with their respective type information and comments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Member {
     /// A basic data member with type and name
     Basic {
@@ -1143,6 +1433,15 @@ pub enum Member {
         /// List of function arguments as (name, type) pairs
         args: Vec<(String, Ref<Type>)>,
     },
+}
+
+impl Member {
+    pub fn name(&self) -> String {
+        match self {
+            Self::Basic { name, .. } => name.clone(),
+            Self::Function { name, .. } => name.clone(),
+        }
+    }
 }
 
 impl PartialEq for Member {
@@ -1216,24 +1515,8 @@ impl<'a> Member {
         } else {
             // Try to resolve the type with namespace resolution
             let resolved_type = Self::resolve_type_name(t, bv, current_namespace);
-            if let Some(type_id) = bv.type_id_by_name(&resolved_type) {
-                let named_ref = NamedTypeReference::new_with_id(
-                    NamedTypeReferenceClass::StructNamedTypeClass,
-                    &type_id,
-                    &resolved_type,
-                );
-                // Hack: `Type::named_type(&named_ref)` always returns
-                // a reference with width 0, making any member structs
-                // (that are not pointers to structs) appear with 0 size.
-                // Workaround using `Type::named_type_from_type` after
-                // fetching the type with `type_by_ref` using the reference
-                // above
-                Type::named_type_from_type(
-                    named_ref.name(),
-                    bv.type_by_ref(&named_ref)
-                        .expect("Could not find type by ref")
-                        .as_ref(),
-                )
+            if let Some(tt) = get_non_primitive_type_by_name(&resolved_type, bv) {
+                tt
             } else {
                 // TODO consider returning option and warn
                 panic!("Could not find type: {}", resolved_type);
@@ -1315,6 +1598,14 @@ impl<'a> Member {
             let mut def = def.to_string();
             // Try and replace templated member types, if they exist
             if let Some(t_members) = template_members {
+                if template_defs.is_none() {
+                    log::error!("Attempting to process templated member `{def}` but missing defs");
+                    return Self::Basic {
+                        name: "".to_string(),
+                        typ: is_primitive("void").unwrap(),
+                        comments: vec![],
+                    };
+                }
                 let t_defs = template_defs.unwrap();
                 let mut tokens = parse_template_member_definition(&def);
 
@@ -1913,7 +2204,7 @@ impl<'a> Parser<'a> {
                                 .expect("Could not find closing token");
                             s2 = s2.trim();
                             log::debug!("Got class {}: {}", s, s2);
-                            let class =
+                            let mut class =
                                 Class::new(s, s2, self.bv, self.get_current_namespace_path());
                             class.define(self.bv);
                             idx += i2 + 1;
@@ -2050,15 +2341,72 @@ pub extern "C" fn CorePluginInit() -> bool {
 #[cfg(test)]
 mod tests {
     use binaryninja::headless::Session;
+    use binaryninja::rc::Ref;
+    use binaryninja::types::Type;
     use std::fs::File;
     use std::io::Read;
     use std::path::PathBuf;
 
     use crate::{
-        get_type_width_by_name, is_primitive, parse_name, parse_template_definition,
-        parse_template_instantiation, Class, Enum, Member, Parser, Structure, Template,
+        get_non_primitive_type_by_name, get_type_by_name, get_type_width_by_name, is_primitive,
+        parse_name, parse_template_definition, parse_template_instantiation, Class, Enum, Member,
+        Parser, Structure, Template,
     };
     use binaryninja::binary_view::BinaryViewExt;
+
+    fn get_member_at_struct_offset(
+        vtable: &Ref<Type>,
+        bv: &binaryninja::binary_view::BinaryView,
+        offset: u64,
+    ) -> Option<Ref<Type>> {
+        let s = vtable.get_structure().unwrap();
+        if let Some(f) = s.members().iter().filter(|x| x.offset == offset).next() {
+            return Some(f.ty.contents.clone());
+        } else {
+            for base in s.base_structures() {
+                let base_type = bv.type_by_id(&base.ty.id()).unwrap();
+                if let Some(member) =
+                    get_member_at_struct_offset(&base_type, bv, offset - base.offset)
+                {
+                    return Some(member);
+                }
+            }
+        }
+        None
+    }
+
+    fn get_member_name_at_offset(
+        vtable: &Ref<Type>,
+        bv: &binaryninja::binary_view::BinaryView,
+        offset: u64,
+    ) -> Option<String> {
+        let s = vtable.get_structure().unwrap();
+        if let Some(f) = s.members().iter().filter(|x| x.offset == offset).next() {
+            return Some(f.name.to_string());
+        } else {
+            for base in s.base_structures() {
+                let base_type = bv.type_by_id(&base.ty.id()).unwrap();
+                if let Some(name) = get_member_name_at_offset(&base_type, bv, offset - base.offset)
+                {
+                    return Some(name);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn get_function_argument_type_by_name(f: &Ref<Type>, name: &str) -> Option<Ref<Type>> {
+        // f is a PointerTypeClass
+        let child = f.child_type()?;
+        child
+            .contents
+            .parameters()?
+            .iter()
+            .filter(|x| &x.name.to_string() == name)
+            .next()
+            .map(|x| x.ty.contents.clone())
+    }
 
     #[test]
     fn test_parsing() {
@@ -2073,7 +2421,6 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .expect("Could not read file contents");
-        println!("File contents:\n{}", contents);
         let p = Parser {
             bv: bv.as_ref(),
             namespace_stack: vec![],
@@ -2160,6 +2507,8 @@ mod tests {
         assert!(is_primitive("uint64_t").is_some());
         assert!(is_primitive("bool").is_some());
         assert!(is_primitive("void").is_some());
+        assert!(is_primitive("float").is_some());
+        assert!(is_primitive("double").is_some());
 
         // Test non-primitive types that should return None
         assert!(is_primitive("MyStruct").is_none());
@@ -2167,8 +2516,6 @@ mod tests {
         assert!(is_primitive("vector<int>").is_none());
         assert!(is_primitive("custom_type").is_none());
         assert!(is_primitive("").is_none());
-        assert!(is_primitive("float").is_none()); // not in the primitive map
-        assert!(is_primitive("double").is_none()); // not in the primitive map
     }
 
     #[test]
@@ -2435,9 +2782,6 @@ mod tests {
             packed_size, 6,
             "Packed struct should be 6 bytes without padding"
         );
-
-        println!("Regular struct size: {} bytes", regular_size);
-        println!("Packed struct size: {} bytes", packed_size);
     }
 
     #[test]
@@ -2684,7 +3028,7 @@ mod tests {
         let bv = headless_session.load(&path).expect("Couldn't open bv");
 
         // Define classes in different namespaces
-        let global_class = Class::new(
+        let mut global_class = Class::new(
             "class MyClass",
             "MyClass();\n~MyClass();\n// ; end vtable\nint32_t value;",
             bv.as_ref(),
@@ -2692,7 +3036,7 @@ mod tests {
         );
         global_class.define(bv.as_ref());
 
-        let ns_class = Class::new(
+        let mut ns_class = Class::new(
             "class MyClass",
             "MyClass();\n~MyClass();\n// ; end vtable\nint64_t data;",
             bv.as_ref(),
@@ -2754,5 +3098,1283 @@ mod tests {
         assert_eq!(get_type_width_by_name("QQQ::RRR::aaa", &bv), Some(0x18)); // void* + bool + padding + uint64_t
         assert_eq!(get_type_width_by_name("QQQ::RRR::bbb", &bv), Some(0x18)); // QQQ::RRR::aaa
         assert_eq!(get_type_width_by_name("QQQ::RRR::ccc", &bv), Some(0x10)); // QQQ::aaa
+    }
+
+    #[test]
+    fn test_multi_level_inheritance_vtable_overrides() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define base class with virtual methods
+        let mut base_class = Class::new(
+            "class BaseClass",
+            r#"BaseClass();
+~BaseClass();
+void methodA();
+int32_t methodB(int32_t param);
+// ; end vtable
+int32_t base_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base_class.define(bv.as_ref());
+
+        // Define middle class that inherits from BaseClass and overrides some methods
+        let mut middle_class = Class::new(
+            "class MiddleClass : BaseClass",
+            r#"MiddleClass(); // ; override void (* BaseClass_vtable::BaseClass)(struct BaseClass* this);
+~MiddleClass(); // ; override void (* BaseClass_vtable::~BaseClass)(struct BaseClass* this);
+int32_t methodB(int32_t param); // ; override int32_t (* BaseClass_vtable::methodB)(struct BaseClass* this, int32_t param);
+void methodC();
+// ; end vtable
+int64_t middle_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        middle_class.define(bv.as_ref());
+
+        // Define derived class that inherits from MiddleClass and overrides more methods
+        let mut derived_class = Class::new(
+            "class DerivedClass : MiddleClass",
+            r#"DerivedClass(); // ; override void (* MiddleClass_vtable_BaseClass::MiddleClass)(struct MiddleClass* this);
+~DerivedClass(); // ; override void (* MiddleClass_vtable_BaseClass::~MiddleClass)(struct MiddleClass* this);
+void methodA(); // ; override void (* BaseClass_vtable::methodA)(struct BaseClass* this);
+void methodC(); // ; override void (* MiddleClass_vtable_BaseClass::methodC)(struct MiddleClass* this);
+bool methodD(float f);
+// ; end vtable
+uint32_t derived_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        derived_class.define(bv.as_ref());
+
+        // Verify all classes are defined
+        assert!(bv.type_id_by_name("BaseClass").is_some());
+        assert!(bv.type_id_by_name("MiddleClass").is_some());
+        assert!(bv.type_id_by_name("DerivedClass").is_some());
+
+        // Check that vtable definition worked correctly
+        assert_eq!(
+            get_type_width_by_name("BaseClass_vtable", &bv).unwrap(),
+            0x20
+        );
+        assert_eq!(
+            get_type_width_by_name("MiddleClass_vtable_BaseClass", &bv).unwrap(),
+            0x28
+        );
+        assert_eq!(
+            get_type_width_by_name("DerivedClass_vtable_MiddleClass", &bv).unwrap(),
+            0x30
+        );
+
+        // Verify inheritance chain
+        assert_eq!(base_class.base_classes.len(), 0);
+        assert_eq!(middle_class.base_classes.len(), 1);
+        assert_eq!(middle_class.base_classes[0], "BaseClass");
+        assert_eq!(derived_class.base_classes.len(), 1);
+        assert_eq!(derived_class.base_classes[0], "MiddleClass");
+
+        // Check arguments to inherited and derived functions
+        let base_type = get_type_by_name("BaseClass_vtable", &bv).unwrap();
+        let middle_type = get_type_by_name("MiddleClass_vtable_BaseClass", &bv).unwrap();
+        let derived_type = get_type_by_name("DerivedClass_vtable_MiddleClass", &bv).unwrap();
+        let base_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("BaseClass", &bv).unwrap(),
+        );
+        let middle_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MiddleClass", &bv).unwrap(),
+        );
+        let derived_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("DerivedClass", &bv).unwrap(),
+        );
+
+        // BaseClass argument is type BaseClass
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x0).unwrap(),
+            "BaseClass".to_string()
+        );
+        assert_eq!(
+            base_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&base_type, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // ~BaseClass argument is type BaseClass
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x8).unwrap(),
+            "~BaseClass".to_string()
+        );
+        assert_eq!(
+            base_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&base_type, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodA argument is type BaseClass
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x10).unwrap(),
+            "methodA".to_string()
+        );
+        assert_eq!(
+            base_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&base_type, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodB argument is type BaseClass
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x18).unwrap(),
+            "methodB".to_string()
+        );
+        assert_eq!(
+            base_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&base_type, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+
+        // MiddleClass argument is type MiddleClass
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x0).unwrap(),
+            "MiddleClass".to_string()
+        );
+        assert_eq!(
+            middle_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&middle_type, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // ~MiddleClass argument is type MiddleClass
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x8).unwrap(),
+            "~MiddleClass".to_string()
+        );
+        assert_eq!(
+            middle_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&middle_type, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodA argument is type BaseClass - not overridden
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x10).unwrap(),
+            "methodA".to_string()
+        );
+        assert_eq!(
+            base_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&middle_type, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodB argument is type MiddleClass
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x18).unwrap(),
+            "methodB".to_string()
+        );
+        assert_eq!(
+            middle_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&middle_type, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodC argument is type MiddleClass
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x20).unwrap(),
+            "methodC".to_string()
+        );
+        assert_eq!(
+            middle_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&middle_type, &bv, 0x20).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+
+        // DerivedClass argument is type DerivedClass
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x0).unwrap(),
+            "DerivedClass".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // ~DerivedClass argument is type DerivedClass
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x8).unwrap(),
+            "~DerivedClass".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodA argument is type DerivedClass - overridden at this level
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x10).unwrap(),
+            "methodA".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodB argument is type MiddleClass - Not overridden
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x18).unwrap(),
+            "methodB".to_string()
+        );
+        assert_eq!(
+            middle_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        // methodC argument is type DerivedClass
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x20).unwrap(),
+            "methodC".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type, &bv, 0x20).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_multi_level_inheritance_member_handling() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define base class with member
+        let mut base_class = Class::new(
+            "class MemberBase",
+            r#"MemberBase();
+~MemberBase();
+// ; end vtable
+char base_char;
+int32_t base_int;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base_class.define(bv.as_ref());
+
+        // Define middle class with additional members and member override
+        let mut middle_class = Class::new(
+            "class MemberMiddle : MemberBase",
+            r#"MemberMiddle();
+~MemberMiddle();
+// ; end vtable
+int64_t middle_long;
+void* middle_ptr;
+uint32_t base_int; // ; override int32_t MemberBase::base_int;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        middle_class.define(bv.as_ref());
+
+        // Define derived class with more members and another override
+        let mut derived_class = Class::new(
+            "class MemberDerived : MemberMiddle",
+            r#"MemberDerived();
+~MemberDerived();
+// ; end vtable
+uint16_t derived_short;
+bool derived_bool;
+bool base_char; // ; override char MemberBase::base_char;
+uint64_t middle_ptr; // ; override void* MemberMiddle::middle_ptr;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        derived_class.define(bv.as_ref());
+
+        // Verify class sizes include inherited members
+        let base_size = get_type_width_by_name("MemberBase", &bv).expect("Base class size");
+        let middle_size = get_type_width_by_name("MemberMiddle", &bv).expect("Middle class size");
+        let derived_size =
+            get_type_width_by_name("MemberDerived", &bv).expect("Derived class size");
+
+        // Base class: vtable ptr (8) + char (1) + padding (3) + int32_t (4) = 16 bytes
+        assert_eq!(base_size, 0x10);
+
+        // Middle class: Base class (16) + long (8) + pointer (8)
+        assert_eq!(middle_size, 0x20);
+
+        // Derived class: Middle class (0x20) + short (2) + bool (1) + padding (1)
+        assert_eq!(derived_size, 0x24);
+
+        // Verify member counts
+        assert_eq!(base_class.member_variables.len(), 2); // base_char, base_int
+        assert_eq!(middle_class.member_variables.len(), 3); // middle_long, middle_ptr, base_int override
+        assert_eq!(derived_class.member_variables.len(), 4); // derived_short, derived_bool, middle_ptr override, base_char override
+
+        // Verify override details
+        if let Some((Member::Basic { name, typ, .. }, _)) =
+            base_class.member_variables.last().as_ref()
+        {
+            assert_eq!(*typ, is_primitive("int32_t").unwrap());
+            assert_eq!(name, "base_int");
+        } else {
+            panic!("Wrong type for member variable");
+        }
+        if let Some((Member::Basic { name, typ, .. }, _)) =
+            middle_class.member_variables.last().as_ref()
+        {
+            assert_eq!(*typ, is_primitive("uint32_t").unwrap());
+            assert_eq!(name, "base_int");
+        } else {
+            panic!("Wrong type for member variable");
+        }
+
+        if let Some((Member::Basic { name, typ, .. }, _)) =
+            derived_class.member_variables.last().as_ref()
+        {
+            assert_eq!(*typ, is_primitive("uint64_t").unwrap());
+            assert_eq!(name, "middle_ptr");
+        } else {
+            panic!("Wrong type for member variable");
+        }
+
+        // Verify class composition
+        let base_type = get_type_by_name("MemberBase", &bv).unwrap();
+        let middle_type = get_type_by_name("MemberMiddle", &bv).unwrap();
+        let derived_type = get_type_by_name("MemberDerived", &bv).unwrap();
+        let base_class_vtable_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MemberBase_vtable", &bv).unwrap(),
+        );
+        let middle_class_vtable_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MemberMiddle_vtable_MemberBase", &bv).unwrap(),
+        );
+        let derived_class_vtable_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MemberDerived_vtable_MemberMiddle", &bv).unwrap(),
+        );
+        let void_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &is_primitive("void").unwrap(),
+        );
+
+        // MemberBase should be
+        // 0x0: MemberBase_vtable* vtable
+        // 0x8: char base_char
+        // 0xc: int32_t base_int
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x0).unwrap(),
+            "vtable".to_string()
+        );
+        assert_eq!(
+            base_class_vtable_ptr,
+            get_member_at_struct_offset(&base_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x8).unwrap(),
+            "base_char".to_string()
+        );
+        assert_eq!(
+            is_primitive("char").unwrap(),
+            get_member_at_struct_offset(&base_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0xc).unwrap(),
+            "base_int".to_string()
+        );
+        assert_eq!(
+            is_primitive("int32_t").unwrap(),
+            get_member_at_struct_offset(&base_type, &bv, 0xc).unwrap(),
+        );
+
+        // MemberMiddle should be
+        // 0x0: MemberMiddle_vtable_MemberBase* vtable_MemberBase
+        // 0x8: char base_char
+        // 0xc: uint32_t base_int // overridden
+        // 0x10: int64_t middle_long
+        // 0x18: void* middle_ptr
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x0).unwrap(),
+            "vtable_MemberBase".to_string()
+        );
+        assert_eq!(
+            middle_class_vtable_ptr,
+            get_member_at_struct_offset(&middle_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x8).unwrap(),
+            "base_char".to_string()
+        );
+        assert_eq!(
+            is_primitive("char").unwrap(),
+            get_member_at_struct_offset(&middle_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0xc).unwrap(),
+            "base_int".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint32_t").unwrap(),
+            get_member_at_struct_offset(&middle_type, &bv, 0xc).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x10).unwrap(),
+            "middle_long".to_string()
+        );
+        assert_eq!(
+            is_primitive("int64_t").unwrap(),
+            get_member_at_struct_offset(&middle_type, &bv, 0x10).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&middle_type, &bv, 0x18).unwrap(),
+            "middle_ptr".to_string()
+        );
+        assert_eq!(
+            void_ptr,
+            get_member_at_struct_offset(&middle_type, &bv, 0x18).unwrap(),
+        );
+
+        // MemberDerived should be
+        // 0x0: MemberDerived_vtable_MemberMiddle* vtable_MemberMiddle
+        // 0x8: bool base_char
+        // 0xc: uint32_t base_int // overridden in Middle
+        // 0x10: int64_t middle_long
+        // 0x18: uint64_t middle_ptr
+        // 0x20: uint16_t derived_short
+        // 0x22: bool derived_bool
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x0).unwrap(),
+            "vtable_MemberMiddle".to_string()
+        );
+        assert_eq!(
+            derived_class_vtable_ptr,
+            get_member_at_struct_offset(&derived_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x8).unwrap(),
+            "base_char".to_string()
+        );
+        assert_eq!(
+            is_primitive("bool").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0xc).unwrap(),
+            "base_int".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint32_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0xc).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x10).unwrap(),
+            "middle_long".to_string()
+        );
+        assert_eq!(
+            is_primitive("int64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x10).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x18).unwrap(),
+            "middle_ptr".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x18).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x20).unwrap(),
+            "derived_short".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint16_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x20).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x22).unwrap(),
+            "derived_bool".to_string()
+        );
+        assert_eq!(
+            is_primitive("bool").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x22).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_multi_level_multiple_inheritance() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define four base classes
+        let mut base1 = Class::new(
+            "class Base1",
+            r#"Base1();
+~Base1();
+void method1();
+// ; end vtable
+int32_t base1_member;
+int32_t base1_member2"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base1.define(bv.as_ref());
+
+        let mut base2 = Class::new(
+            "class Base2",
+            r#"Base2();
+~Base2();
+void method2();
+// ; end vtable
+int64_t base2_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base2.define(bv.as_ref());
+
+        let mut base3 = Class::new(
+            "class Base3",
+            r#"Base3();
+~Base3();
+void method3();
+// ; end vtable
+uint32_t base3_member;
+uint32_t base3_member2"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base3.define(bv.as_ref());
+
+        let mut base4 = Class::new(
+            "class Base4",
+            r#"Base4();
+~Base4();
+void method4();
+// ; end vtable
+uint64_t base4_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base4.define(bv.as_ref());
+
+        // Define middle class with multiple inheritance (using test.hpp syntax)
+        let mut middle1 = Class::new(
+            "class MultiMiddle1 : Base1, Base2",
+            r#"MultiMiddle1(); // ; override void (* Base1_vtable::Base1)(struct Base1* this);
+~MultiMiddle1(); // ; override void (* Base1_vtable::~Base1)(struct Base1* this);
+void MultiMiddle1_constructor(); // ; override void (* Base2_vtable::Base2)(struct Base2* this);
+void MultiMiddle1_destructor(); // ; override void (* Base2_vtable::~Base2)(struct Base2* this);
+void method1(); // ; override void (* Base1_vtable::method1)(struct Base1* this);
+void methodMiddle1();
+// ; end vtable
+uint64_t base2_member; // ; override int64_t Base2::base2_member;
+uint64_t middle1_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        middle1.define(bv.as_ref());
+
+        let mut middle2 = Class::new(
+            "class MultiMiddle2 : Base3, Base4",
+            r#"MultiMiddle2(); // ; override void (* Base3_vtable::Base3)(struct Base3* this);
+~MultiMiddle2(); // ; override void (* Base3_vtable::~Base3)(struct Base3* this);
+void MultiMiddle2_constructor(); // ; override void (* Base4_vtable::Base4)(struct Base4* this);
+void MultiMiddle2_destructor(); // ; override void (* Base4_vtable::~Base4)(struct Base4* this);
+void method4(); // ; override void (* Base4_vtable::method4)(struct Base4* this);
+void methodMiddle2();
+// ; end vtable
+int64_t middle2_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        middle2.define(bv.as_ref());
+
+        // Define derived class inheriting from multiple inheritance middle class
+        let mut derived = Class::new(
+            "class MultiDerived : MultiMiddle1, MultiMiddle2",
+            r#"MultiDerived(); // ; override void (* MultiMiddle1_vtable_Base1::MultiMiddle1)(struct MultiMiddle1* this);
+~MultiDerived(); // ; override void (* MultiMiddle1_vtable_Base1::~MultiMiddle1)(struct MultiMiddle1* this);
+void MultiDerived_constructor1(); // ; override void (* MultiMiddle1_vtable_Base2::MultiMiddle1_constructor)(struct MultiMiddle1* this);
+void MultiDerived_destructor1(); // ; override void (* MultiMiddle1_vtable_Base2::MultiMiddle1_destructor)(struct MultiMiddle1* this);
+void MultiDerived_constructor2(); // ; override void (* MultiMiddle2_vtable_Base3::MultiMiddle2)(struct MultiMiddle2* this);
+void MultiDerived_destructor2(); // ; override void (* MultiMiddle2_vtable_Base3::~MultiMiddle2)(struct MultiMiddle2* this);
+void MultiDerived_constructor3(); // ; override void (* MultiMiddle2_vtable_Base4::MultiMiddle2_constructor)(struct MultiMiddle2* this);
+void MultiDerived_destructor3(); // ; override void (* MultiMiddle2_vtable_Base4::MultiMiddle2_destructor)(struct MultiMiddle2* this);
+void methodMiddle1(); // ; override void (* MultiMiddle1_vtable_Base1::methodMiddle1)(struct MultiMiddle1* this);
+void method4(); // ; override void (* Base4_vtable::method4)(struct Base4* this);
+void methodDerived();
+// ; end vtable
+int64_t base4_member; // ; override uint64_t Base4::base4_member;
+bool derived_member;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        derived.define(bv.as_ref());
+
+        // Verify inheritance relationships
+        assert_eq!(middle1.base_classes.len(), 2);
+        assert!(middle1.base_classes.contains(&"Base1".to_string()));
+        assert!(middle1.base_classes.contains(&"Base2".to_string()));
+        assert_eq!(middle2.base_classes.len(), 2);
+        assert!(middle2.base_classes.contains(&"Base3".to_string()));
+        assert!(middle2.base_classes.contains(&"Base4".to_string()));
+        assert_eq!(derived.base_classes.len(), 2);
+        assert!(derived.base_classes.contains(&"MultiMiddle1".to_string()));
+        assert!(derived.base_classes.contains(&"MultiMiddle2".to_string()));
+
+        // Verify vtable methods are collected properly
+        assert_eq!(base1.vtable_methods.len(), 0); // constructor, destructor, method1
+        assert_eq!(base2.vtable_methods.len(), 0); // constructor, destructor, method2
+        assert_eq!(base3.vtable_methods.len(), 0); // constructor, destructor, method1
+        assert_eq!(base4.vtable_methods.len(), 0); // constructor, destructor, method2
+        assert_eq!(middle1.vtable_methods.len(), 0); // overrides + new methodMiddle
+        assert_eq!(middle2.vtable_methods.len(), 0); // overrides + new methodMiddle
+        assert_eq!(derived.vtable_methods.len(), 0); // overrides + new methodDerived
+
+        // Check sizes account for multiple inheritance
+        assert_eq!(get_type_width_by_name("Base1", &bv).unwrap(), 0x10); // vtable (8) + int32_t * 2 (8)
+        assert_eq!(get_type_width_by_name("Base2", &bv).unwrap(), 0x10); // vtable (8) + int64_t (8)
+        assert_eq!(get_type_width_by_name("Base3", &bv).unwrap(), 0x10); // vtable (8) + uint32_t * 2 (8)
+        assert_eq!(get_type_width_by_name("Base4", &bv).unwrap(), 0x10); // vtable (8) + uint64_t (8)
+        assert_eq!(get_type_width_by_name("MultiMiddle1", &bv).unwrap(), 0x28); // base1 (0x10) + base2 (0x10) + uint64_t (8)
+        assert_eq!(get_type_width_by_name("MultiMiddle2", &bv).unwrap(), 0x28); // base3 (0x10) + base4 (0x10) + uint64_t (8)
+        assert_eq!(get_type_width_by_name("MultiDerived", &bv).unwrap(), 0x51); // MultiMiddle1 (0x28) + MultiMiddle2 (0x28) + bool (1) + padding (3)
+
+        // Verify class composition
+        let derived_type = get_type_by_name("MultiDerived", &bv).unwrap();
+        let derived_type_vtable_1 =
+            get_type_by_name("MultiDerived_vtable_MultiMiddle1", &bv).unwrap();
+        let derived_type_vtable_2 = get_type_by_name("MultiDerived_vtable_Base2", &bv).unwrap();
+        let derived_type_vtable_3 =
+            get_type_by_name("MultiDerived_vtable_MultiMiddle2", &bv).unwrap();
+        let derived_type_vtable_4 = get_type_by_name("MultiDerived_vtable_Base4", &bv).unwrap();
+        let base_2_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Base2", &bv).unwrap(),
+        );
+        let base_3_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Base3", &bv).unwrap(),
+        );
+        let middle_1_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiMiddle1", &bv).unwrap(),
+        );
+        let middle_2_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiMiddle2", &bv).unwrap(),
+        );
+        let derived_class_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiDerived", &bv).unwrap(),
+        );
+        let derived_class_vtable_ptr_1 = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiDerived_vtable_MultiMiddle1", &bv).unwrap(),
+        );
+        let derived_class_vtable_ptr_2 = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiDerived_vtable_Base2", &bv).unwrap(),
+        );
+        let derived_class_vtable_ptr_3 = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiDerived_vtable_MultiMiddle2", &bv).unwrap(),
+        );
+        let derived_class_vtable_ptr_4 = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("MultiDerived_vtable_Base4", &bv).unwrap(),
+        );
+
+        // Verify MultiDerived members
+
+        // MultiDerived should be
+        // 0x00: MultiMiddle1_vtable_Base1* vtable_MultiMiddle1
+        // 0x08: int32_t base1_member
+        // 0x0c: int32_t base1_member2
+        // 0x10: MultiMiddle1_vtable_Base1* vtable_Base2
+        // 0x18: uint64_t base2_member // overridden by MultiMiddle1
+        // 0x20: uint64_t middle1_member
+        // 0x28: MultiMiddle2_vtable_Base3* vtable_MultiMiddle2
+        // 0x30: uint32_t base3_member
+        // 0x34: uint32_t base3_member2
+        // 0x38: MultiMiddle2_vtable_Base4* vtable_Base4
+        // 0x40: int64_t base4_member // overridden by MutliDerived
+        // 0x48: int64_t middle1_member
+        // 0x50: bool derived_member
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x0).unwrap(),
+            "vtable_MultiMiddle1".to_string()
+        );
+        assert_eq!(
+            derived_class_vtable_ptr_1,
+            get_member_at_struct_offset(&derived_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x8).unwrap(),
+            "base1_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("int32_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0xc).unwrap(),
+            "base1_member2".to_string()
+        );
+        assert_eq!(
+            is_primitive("int32_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0xc).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x10).unwrap(),
+            "vtable_Base2".to_string()
+        );
+        assert_eq!(
+            derived_class_vtable_ptr_2,
+            get_member_at_struct_offset(&derived_type, &bv, 0x10).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x18).unwrap(),
+            "base2_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x18).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x20).unwrap(),
+            "middle1_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x20).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x28).unwrap(),
+            "vtable_MultiMiddle2".to_string()
+        );
+        assert_eq!(
+            derived_class_vtable_ptr_3,
+            get_member_at_struct_offset(&derived_type, &bv, 0x28).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x30).unwrap(),
+            "base3_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint32_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x30).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x34).unwrap(),
+            "base3_member2".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint32_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x34).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x38).unwrap(),
+            "vtable_Base4".to_string()
+        );
+        assert_eq!(
+            derived_class_vtable_ptr_4,
+            get_member_at_struct_offset(&derived_type, &bv, 0x38).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x40).unwrap(),
+            "base4_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("int64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x40).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x48).unwrap(),
+            "middle2_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("int64_t").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x48).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type, &bv, 0x50).unwrap(),
+            "derived_member".to_string()
+        );
+        assert_eq!(
+            is_primitive("bool").unwrap(),
+            get_member_at_struct_offset(&derived_type, &bv, 0x50).unwrap(),
+        );
+
+        // Verify MultiDerived vtables
+
+        // vtable_MultiMiddle1 should be
+        // 0x00: MultiDerived()
+        // 0x08: ~MultiDerived()
+        // 0x10: void method1(MultiMiddle1* this)
+        // 0x18: void methodMiddle1(MultiDerived* this)
+        // 0x20: void methodDerived(MultiDerived* this)
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_1, &bv, 0x0).unwrap(),
+            "MultiDerived".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_1, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_1, &bv, 0x8).unwrap(),
+            "~MultiDerived".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_1, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_1, &bv, 0x10).unwrap(),
+            "method1".to_string()
+        );
+        assert_eq!(
+            middle_1_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_1, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_1, &bv, 0x18).unwrap(),
+            "methodMiddle1".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_1, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_1, &bv, 0x20).unwrap(),
+            "methodDerived".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_1, &bv, 0x20).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+
+        // vtable_Base2 should be
+        // 0x00: MultiDerived_constructor1()
+        // 0x08: MultiDerived_destructor1()
+        // 0x10: void method2(Base2* this)
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_2, &bv, 0x0).unwrap(),
+            "MultiDerived_constructor1".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_2, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_2, &bv, 0x8).unwrap(),
+            "MultiDerived_destructor1".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_2, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_2, &bv, 0x10).unwrap(),
+            "method2".to_string()
+        );
+        assert_eq!(
+            base_2_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_2, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+
+        // vtable_MultiMiddle2 should be
+        // 0x00: MultiDerived_constructor2()
+        // 0x08: MultiDerived_destructor2()
+        // 0x10: void method3(Base3* this)
+        // 0x18: void methodMiddle2(MultiMiddle2* this)
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_3, &bv, 0x0).unwrap(),
+            "MultiDerived_constructor2".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_3, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_3, &bv, 0x8).unwrap(),
+            "MultiDerived_destructor2".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_3, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_3, &bv, 0x10).unwrap(),
+            "method3".to_string()
+        );
+        assert_eq!(
+            base_3_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_3, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_3, &bv, 0x18).unwrap(),
+            "methodMiddle2".to_string()
+        );
+        assert_eq!(
+            middle_2_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_3, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+
+        // vtable_Base4 should be
+        // 0x00: MultiDerived_constructor3()
+        // 0x08: MultiDerived_destructor3()
+        // 0x10: void method4(MultiDerived* this)
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_4, &bv, 0x0).unwrap(),
+            "MultiDerived_constructor3".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_4, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_4, &bv, 0x8).unwrap(),
+            "MultiDerived_destructor3".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_4, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&derived_type_vtable_4, &bv, 0x10).unwrap(),
+            "method4".to_string()
+        );
+        assert_eq!(
+            derived_class_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&derived_type_vtable_4, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_deep_inheritance_chain() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Create a 4-level deep inheritance chain
+        let mut level1 = Class::new(
+            "class Level1",
+            r#"Level1();
+~Level1();
+void virtualMethod();
+// ; end vtable
+int8_t level1_data;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        level1.define(bv.as_ref());
+
+        let mut level2 = Class::new(
+            "class Level2 : Level1",
+            r#"Level2(); // ; override void (* Level1_vtable::Level1)(struct Level1* this);
+~Level2(); // ; override void (* Level1_vtable::~Level1)(struct Level1* this);
+void virtualMethod(); // ; override void (* Level1_vtable::virtualMethod)(struct Level1* this);
+void level2Method();
+// ; end vtable
+int16_t level2_data;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        level2.define(bv.as_ref());
+
+        let mut level3 = Class::new(
+            "class Level3 : Level2",
+            r#"Level3(); // ; override void (* Level2_vtable_Level1::Level2)(struct Level2* this);
+~Level3(); // ; override void (* Level2_vtable_Level1::~Level2)(struct Level2* this);
+void level2Method(); // ; override void (* Level2_vtable_Level1::level2Method)(struct Level2* this);
+void level3Method();
+// ; end vtable
+int32_t level3_data;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        level3.define(bv.as_ref());
+
+        let mut level4 = Class::new(
+            "class Level4 : Level3",
+            r#"Level4(); // ; override void (* Level3_vtable_Level2::Level3)(struct Level3* this);
+~Level4(); // ; override void (* Level3_vtable_Level2::~Level3)(struct Level3* this);
+void level3Method(); // ; override void (* Level3_vtable_Level2::level3Method)(struct Level3* this);
+void level4Method();
+// ; end vtable
+int64_t level4_data;"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        level4.define(bv.as_ref());
+
+        // Verify inheritance chain
+        assert_eq!(level1.base_classes.len(), 0);
+        assert_eq!(level2.base_classes, vec!["Level1"]);
+        assert_eq!(level3.base_classes, vec!["Level2"]);
+        assert_eq!(level4.base_classes, vec!["Level3"]);
+
+        // Verify vtable method counts
+        assert!(level1.vtable_methods.is_empty());
+        assert!(level2.vtable_methods.is_empty());
+        assert!(level3.vtable_methods.is_empty());
+        assert!(level4.vtable_methods.is_empty());
+
+        // Verify MultiDerived members
+
+        let level_4_type = get_type_by_name("Level4", &bv).unwrap();
+        let level_4_vtable = get_type_by_name("Level4_vtable_Level3", &bv).unwrap();
+        let level_4_vtable_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Level4_vtable_Level3", &bv).unwrap(),
+        );
+        let level_1_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Level1", &bv).unwrap(),
+        );
+
+        let level_2_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Level2", &bv).unwrap(),
+        );
+        let level_3_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Level3", &bv).unwrap(),
+        );
+        let level_4_ptr = Type::pointer(
+            &bv.default_arch().expect("Could not find default arch"),
+            &get_non_primitive_type_by_name("Level4", &bv).unwrap(),
+        );
+
+        // Level4 should be
+        // 0x00: Level4_vtable_Level3* vtable_Level3
+        // 0x08: int8_t level1_data
+        // 0x0a: int16_t level2_data
+        // 0x0c: int32_t level3_data
+        // 0x10: int64_t level4_data
+        assert_eq!(
+            get_member_name_at_offset(&level_4_type, &bv, 0x0).unwrap(),
+            "vtable_Level3".to_string()
+        );
+        assert_eq!(
+            level_4_vtable_ptr,
+            get_member_at_struct_offset(&level_4_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_type, &bv, 0x8).unwrap(),
+            "level1_data".to_string()
+        );
+        assert_eq!(
+            is_primitive("int8_t").unwrap(),
+            get_member_at_struct_offset(&level_4_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_type, &bv, 0xa).unwrap(),
+            "level2_data".to_string()
+        );
+        assert_eq!(
+            is_primitive("int16_t").unwrap(),
+            get_member_at_struct_offset(&level_4_type, &bv, 0xa).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_type, &bv, 0xc).unwrap(),
+            "level3_data".to_string()
+        );
+        assert_eq!(
+            is_primitive("int32_t").unwrap(),
+            get_member_at_struct_offset(&level_4_type, &bv, 0xc).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_type, &bv, 0x10).unwrap(),
+            "level4_data".to_string()
+        );
+        assert_eq!(
+            is_primitive("int64_t").unwrap(),
+            get_member_at_struct_offset(&level_4_type, &bv, 0x10).unwrap(),
+        );
+
+        // Verify Level4 vtable
+
+        // vtable should be
+        // 0x00: Level4()
+        // 0x08: ~Level4()
+        // 0x10: void virtualMethod(Level2* this)
+        // 0x18: void level2Method(Level3* this)
+        // 0x20: void level3Method(Level4* this)
+        // 0x28: void level4Method(Level4* this)
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x0).unwrap(),
+            "Level4".to_string()
+        );
+        assert_eq!(
+            level_4_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x0).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x8).unwrap(),
+            "~Level4".to_string()
+        );
+        assert_eq!(
+            level_4_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x8).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x10).unwrap(),
+            "virtualMethod".to_string()
+        );
+        assert_eq!(
+            level_2_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x10).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x18).unwrap(),
+            "level2Method".to_string()
+        );
+        assert_eq!(
+            level_3_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x18).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x20).unwrap(),
+            "level3Method".to_string()
+        );
+        assert_eq!(
+            level_4_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x20).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_member_name_at_offset(&level_4_vtable, &bv, 0x28).unwrap(),
+            "level4Method".to_string()
+        );
+        assert_eq!(
+            level_4_ptr,
+            get_function_argument_type_by_name(
+                &get_member_at_struct_offset(&level_4_vtable, &bv, 0x28).unwrap(),
+                "this",
+            )
+            .unwrap()
+        );
     }
 }
