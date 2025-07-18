@@ -14,10 +14,12 @@ dependencies = [
 [[package]]
 name = "binaryninja"
 version = "0.1.0"
-source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#01ec263e92c250371d0b4e31a5b5621de3f25f02"
+source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#27a249c7938fe091d77d633129255327c8c6708e"
 dependencies = [
  "binaryninjacore-sys",
  "log",
+ "serde",
+ "serde_derive",
  "serde_json",
  "thiserror",
 ]
@@ -25,7 +27,7 @@ dependencies = [
 [[package]]
 name = "binaryninjacore-sys"
 version = "0.1.0"
-source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#01ec263e92c250371d0b4e31a5b5621de3f25f02"
+source = "git+https://github.com/Vector35/binaryninja-api.git?branch=dev#27a249c7938fe091d77d633129255327c8c6708e"
 dependencies = [
  "bindgen",
  "proc-macro2",
