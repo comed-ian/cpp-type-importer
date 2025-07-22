@@ -255,18 +255,6 @@ class MultiDerived : MultiMiddle1, MultiMiddle2 {
     int64_t base4_member; // ; override uint64_t Base4::base4_member;
     bool derived_member;
 };
-
-struct WWW {
-    uint64_t a;
-    char b[0x10];
-    uint32_t c[0x4];
-};
-
-struct XXX {
-    WWW a[0x3];
-    char* b[0x4];
-    int32_t c[0x8];
-};
  
 namespace QQQ {
     struct aaa {
@@ -289,3 +277,15 @@ namespace QQQ {
         };
     } // end RRR
 } // end QQQ
+
+struct WWW {
+    uint64_t a;
+    char b[0x10];
+    uint32_t c[0x4];
+};
+
+struct XXX {
+    WWW a[0x3];
+    char* b[0x4];
+    int32_t c[0x8];
+};
