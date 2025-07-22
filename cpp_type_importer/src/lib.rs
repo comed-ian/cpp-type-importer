@@ -14,11 +14,9 @@ use std::io::Read;
 use std::path::PathBuf;
 
 // TODO
-// 1. Multi-level inheritance
-// 2. Templated Typedefs
-// 3. Conflicting vtable function names (e.g., MyMethod)
-// 4. Structure offsets
-// 5. Arrays
+// 1. Templated Typedefs
+// 2. Conflicting vtable function names (e.g., MyMethod)
+// 3. Structure offsets
 
 /// Maps C++ primitive type names to Binary Ninja types
 ///
@@ -212,7 +210,8 @@ pub struct Typedef {
 
 impl<'a> Typedef {
     pub fn new(def: &str, namespace_path: Vec<String>) -> Self {
-        let (typ, name, depth) =
+        // TODO add [] to typedefs
+        let (typ, name, depth, _) =
             parse_member_definition(def).expect("Could not parse typedef definition");
         Self {
             name,
@@ -1424,6 +1423,17 @@ pub enum Member {
         /// Associated comments for the member
         comments: Vec<String>,
     },
+    /// An array data member with element type, name, and size
+    Array {
+        /// The member name
+        name: String,
+        /// Binary Ninja type reference for the array element type
+        element_type: Ref<Type>,
+        /// Array size (number of elements)
+        size: u64,
+        /// Associated comments for the member
+        comments: Vec<String>,
+    },
     /// A function pointer member with return type and arguments
     Function {
         /// The function name
@@ -1439,6 +1449,7 @@ impl Member {
     pub fn name(&self) -> String {
         match self {
             Self::Basic { name, .. } => name.clone(),
+            Self::Array { name, .. } => name.clone(),
             Self::Function { name, .. } => name.clone(),
         }
     }
@@ -1459,6 +1470,24 @@ impl PartialEq for Member {
                     ..
                 },
             ) => name1 == name2 && typ1.to_string() == typ2.to_string(),
+            (
+                Member::Array {
+                    name: name1,
+                    element_type: element_type1,
+                    size: size1,
+                    ..
+                },
+                Member::Array {
+                    name: name2,
+                    element_type: element_type2,
+                    size: size2,
+                    ..
+                },
+            ) => {
+                name1 == name2
+                    && element_type1.to_string() == element_type2.to_string()
+                    && size1 == size2
+            }
             (
                 Member::Function {
                     name: name1,
@@ -1579,22 +1608,37 @@ impl<'a> Member {
         template_defs: Option<&Vec<String>>,
         current_namespace: &Vec<String>,
     ) -> Self {
-        let (typ, name, depth) =
+        let (typ, name, depth, arrsize) =
             parse_member_definition(def).expect("Could not parse member definition");
         log::info!(
-            "Got member definition type={}, name={}, depth={}",
+            "Got member definition type={}, name={}, depth={}, arrsize={:x?}",
             typ,
             name,
-            depth
+            depth,
+            arrsize
         );
         if let Some(_) = is_primitive(&typ) {
+            // Is primitive
             let typ = Self::define_type(&typ, depth, bv);
-            return Member::Basic {
-                name,
-                typ,
-                comments: vec![],
-            };
+            match arrsize {
+                Some(l) => {
+                    return Member::Array {
+                        name,
+                        element_type: typ,
+                        size: l,
+                        comments: vec![],
+                    }
+                }
+                None => {
+                    return Member::Basic {
+                        name,
+                        typ,
+                        comments: vec![],
+                    }
+                }
+            }
         } else {
+            // Is not primitive
             let mut def = def.to_string();
             // Try and replace templated member types, if they exist
             if let Some(t_members) = template_members {
@@ -1633,13 +1677,15 @@ impl<'a> Member {
                     name,
                     args
                 );
-                let (return_type, _, depth) = parse_member_definition(return_type)
+                // TODO make these expects into errors
+                // TODO allow [] in arguments to function
+                let (return_type, _, depth, _) = parse_member_definition(return_type)
                     .expect("Could not parse function member return type");
                 let args = parse_template_instantiation(args)
                     .expect("Could not parse function member args");
                 let mut defined_args = vec![];
                 for a in args {
-                    let (typ, name, depth) = parse_member_definition(&a)
+                    let (typ, name, depth, _) = parse_member_definition(&a)
                         .expect("Could not parse argument to function definition");
                     defined_args.push((
                         name,
@@ -1659,14 +1705,27 @@ impl<'a> Member {
                 };
             } else {
                 // Not a function definition
-                let (typ, name, depth) =
+                // TODO turn expect into error
+                let (typ, name, depth, arrsize) =
                     parse_member_definition(&def).expect(&format!("Could not parse {def}"));
                 let typ = Self::define_type_with_namespace(&typ, depth, bv, current_namespace);
-                return Member::Basic {
-                    name,
-                    typ,
-                    comments: vec![],
-                };
+                match arrsize {
+                    Some(l) => {
+                        return Member::Array {
+                            name,
+                            element_type: typ,
+                            size: l,
+                            comments: vec![],
+                        }
+                    }
+                    None => {
+                        return Member::Basic {
+                            name,
+                            typ,
+                            comments: vec![],
+                        }
+                    }
+                }
             }
         }
     }
@@ -1684,6 +1743,32 @@ impl<'a> Member {
             } => {
                 // Simply append basic members
                 log::debug!("Adding member: {}", name);
+                if let Some(o) = offset {
+                    builder.insert(
+                        typ.as_ref(),
+                        &name.clone(),
+                        o,
+                        true, // overwrite existing
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                } else {
+                    builder.append(
+                        typ.as_ref(),
+                        &name.clone(),
+                        MemberAccess::PublicAccess,
+                        MemberScope::NoScope,
+                    );
+                }
+            }
+            Member::Array {
+                name,
+                element_type,
+                size,
+                ..
+            } => {
+                log::debug!("Adding array: {}", name);
+                let typ = Type::array(element_type, *size);
                 if let Some(o) = offset {
                     builder.insert(
                         typ.as_ref(),
@@ -1935,19 +2020,60 @@ fn get_pointer_depth(def: &str) -> (u8, String) {
     (depth, suffix)
 }
 
-/// Parses a member definition into type, name, and pointer depth
+/// Parses array size from a member definition
+///
+/// Handles array size syntax like `[0x10]`, `[16]`, or `[256]`
+///
+/// # Arguments
+/// * `def` - The member definition string containing array syntax
+///
+/// # Returns
+/// `Some((element_name, array_size))` if array syntax is found, `None` otherwise
+fn parse_array_size(def: &str) -> Option<(String, u64)> {
+    if let Some(start) = def.find('[') {
+        if let Some(end) = def.find(']') {
+            let size_str = &def[start + 1..end];
+            let array_size = if size_str.starts_with("0x") || size_str.starts_with("0X") {
+                // Parse hexadecimal
+                u64::from_str_radix(&size_str[2..], 16).ok()?
+            } else {
+                // Parse decimal
+                size_str.parse::<u64>().ok()?
+            };
+            let element_name = def[..start].trim().to_string();
+            return Some((element_name, array_size));
+        }
+    }
+    None
+}
+
+/// Parses a member definition into type, name, pointer depth, and array info
 ///
 /// # Arguments
 /// * `def` - The member definition string
 ///
 /// # Returns
-/// `Some((type, name, pointer_depth))` if parsing succeeds, `None` otherwise
-fn parse_member_definition(def: &str) -> Option<(String, String, u8)> {
+/// `Some((type, name, pointer_depth, array_size))` if parsing succeeds, `None` otherwise
+/// `array_size` is `Some(size)` for arrays, `None` for non-arrays
+fn parse_member_definition(def: &str) -> Option<(String, String, u8, Option<u64>)> {
     let mut def = def.trim();
     if let Some(trimmed) = def.strip_suffix(";") {
         def = trimmed;
     }
     let mut def = def.trim();
+
+    // Check for array syntax first
+    if let Some((element_part, array_size)) = parse_array_size(def) {
+        let name = parse_member_name(&element_part).unwrap_or("".to_string());
+        let mut type_part = element_part.strip_suffix(&name).unwrap();
+        let (depth, suffix) = get_pointer_depth(type_part);
+        if !suffix.is_empty() {
+            type_part = type_part.strip_suffix(&suffix).unwrap();
+        }
+        return Some((type_part.to_string(), name, depth, Some(array_size)));
+    }
+
+    // Handle non-array types
     let name = parse_member_name(def).unwrap_or("".to_string());
     def = def.strip_suffix(&name).unwrap();
     let (depth, suffix) = get_pointer_depth(def);
@@ -1955,7 +2081,7 @@ fn parse_member_definition(def: &str) -> Option<(String, String, u8)> {
         def = def.strip_suffix(&suffix).unwrap();
     }
 
-    Some((def.to_string(), name, depth))
+    Some((def.to_string(), name, depth, None))
 }
 
 /// Parses the member name from a member definition
@@ -2800,6 +2926,106 @@ mod tests {
 
         // Test enum name parsing
         assert_eq!(parse_name("enum MyEnum"), Some("MyEnum".to_string()));
+    }
+
+    #[test]
+    fn test_array_members() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Define base structure with array
+        let mut base_struct = Structure::new(
+            "struct ArrayStruct",
+            r#"uint64_t a;
+char b[0x10];
+uint32_t c[0x8];"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        base_struct.define(bv.as_ref());
+
+        assert_eq!(get_type_width_by_name("ArrayStruct", &bv), Some(0x38));
+        let base_type = get_type_by_name("ArrayStruct", &bv).unwrap();
+        let arr_type_b = Type::array(is_primitive("char").unwrap().as_ref(), 0x10);
+        let arr_type_c = Type::array(is_primitive("uint32_t").unwrap().as_ref(), 0x8);
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x0).unwrap(),
+            "a".to_string()
+        );
+        assert_eq!(
+            is_primitive("uint64_t").unwrap(),
+            get_member_at_struct_offset(&base_type, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x8).unwrap(),
+            "b".to_string()
+        );
+        assert_eq!(
+            arr_type_b,
+            get_member_at_struct_offset(&base_type, &bv, 0x8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type, &bv, 0x18).unwrap(),
+            "c".to_string()
+        );
+        assert_eq!(
+            arr_type_c,
+            get_member_at_struct_offset(&base_type, &bv, 0x18).unwrap(),
+        );
+
+        // Define base structure with array
+        let mut nested_struct = Structure::new(
+            "struct ArrayStruct2",
+            r#"ArrayStruct a[3];
+char* b[0x4];
+int32_t c[0x8];"#,
+            bv.as_ref(),
+            Vec::new(),
+        );
+        nested_struct.define(bv.as_ref());
+
+        assert_eq!(
+            get_type_width_by_name("ArrayStruct2", &bv),
+            Some(0xa8 + 0x20 + 0x20)
+        );
+        let base_type_2 = get_type_by_name("ArrayStruct2", &bv).unwrap();
+        let base_type = get_non_primitive_type_by_name("ArrayStruct", &bv).unwrap();
+        let arr_type_a = Type::array(base_type.as_ref(), 0x3);
+        let arr_type_b = Type::array(
+            Type::pointer(
+                &bv.default_arch().unwrap(),
+                is_primitive("char").unwrap().as_ref(),
+            )
+            .as_ref(),
+            0x4,
+        );
+        let arr_type_c = Type::array(is_primitive("int32_t").unwrap().as_ref(), 0x8);
+        assert_eq!(
+            get_member_name_at_offset(&base_type_2, &bv, 0x0).unwrap(),
+            "a".to_string()
+        );
+        assert_eq!(
+            arr_type_a,
+            get_member_at_struct_offset(&base_type_2, &bv, 0x0).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type_2, &bv, 0xa8).unwrap(),
+            "b".to_string()
+        );
+        assert_eq!(
+            arr_type_b,
+            get_member_at_struct_offset(&base_type_2, &bv, 0xa8).unwrap(),
+        );
+        assert_eq!(
+            get_member_name_at_offset(&base_type_2, &bv, 0xc8).unwrap(),
+            "c".to_string()
+        );
+        assert_eq!(
+            arr_type_c,
+            get_member_at_struct_offset(&base_type_2, &bv, 0xc8).unwrap(),
+        );
     }
 
     #[test]
