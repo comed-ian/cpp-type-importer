@@ -106,6 +106,28 @@ class MMM : HHH, III, LLL {
 };
 
 typedef MMM NNN;
+ 
+namespace QQQ {
+    struct aaa {
+        uint32_t a;
+        void* b;
+    };
+
+    namespace RRR {
+        struct aaa {
+            void* a;
+            uint32_t b;
+        };
+
+        struct bbb {
+            aaa* a;
+        };
+
+        struct ccc {
+            QQQ::aaa a;
+        };
+    } // end RRR
+} // end QQQ
 
 class SSS  {
     SSS();
@@ -255,28 +277,6 @@ class MultiDerived : MultiMiddle1, MultiMiddle2 {
     int64_t base4_member; // ; override uint64_t Base4::base4_member;
     bool derived_member;
 };
- 
-namespace QQQ {
-    struct aaa {
-        uint32_t a;
-        void* b;
-    };
-
-    namespace RRR {
-        struct aaa {
-            void* a;
-            uint32_t b;
-        };
-
-        struct bbb {
-            aaa* a;
-        };
-
-        struct ccc {
-            QQQ::aaa a;
-        };
-    } // end RRR
-} // end QQQ
 
 struct WWW {
     uint64_t a;
@@ -288,4 +288,18 @@ struct XXX {
     WWW a[0x3];
     char* b[0x4];
     int32_t c[0x8];
+};
+
+struct __attribute__((packed)) YYY {
+    // ; __ptr_offset(0x10)
+    uint64_t a;
+    char* b;
+    int32_t c;
+};
+
+struct __attribute__((packed)) ZZZ {
+    // ; __ptr_offset(-0x10)
+    int64_t a;
+    void* b;
+    uint32_t c;
 };

@@ -16,8 +16,8 @@ use std::path::PathBuf;
 // TODO
 // 1. Templated Typedefs
 // 2. Conflicting vtable function names (e.g., MyMethod)
-// 3. Structure offsets
-
+// 3. Add comment lines to middle of structure and class
+// 4. Handle /* */
 /// Maps C++ primitive type names to Binary Ninja types
 ///
 /// # Arguments
@@ -172,7 +172,7 @@ impl<'a> Enum {
         }
     }
 
-    pub fn define(&self, bv: &BinaryView) -> bool {
+    pub fn define(&self, bv: &BinaryView) -> Result<(), String> {
         // Create an enumeration builder
         let mut builder = EnumerationBuilder::new();
 
@@ -191,7 +191,7 @@ impl<'a> Enum {
         // Construct full name with namespace prefix
         let full_name = self.get_full_name();
         bv.define_user_type(&full_name, &enum_type);
-        true
+        Ok(())
     }
 }
 
@@ -320,7 +320,7 @@ impl<'a> Template {
         name.push('<');
         name.push_str(&typenames.join(", "));
         name.push('>');
-        Structure::new_from_members(name, members, 0, self.namespace_path.clone()).define(bv);
+        Structure::new_from_members(name, members, 0, self.namespace_path.clone()).define(bv)?;
         Ok(())
     }
 
@@ -345,7 +345,7 @@ pub struct Structure {
     /// List of struct members
     members: Vec<Member>,
     /// Base offset for the struct
-    offset: u16,
+    offset: i64,
     /// Whether the struct is packed (no padding)
     packed: bool,
     /// Namespace path for this structure
@@ -374,8 +374,18 @@ impl<'a> Structure {
         // Check for packed attribute in the definition
         let packed = def.contains("__attribute__((packed))");
 
+        let mut offset = 0;
+
         let mut members = vec![];
-        for member in body.lines() {
+        for (i, member) in body.lines().enumerate() {
+            if i == 0 {
+                // Check for __ptr_offset(X) directive from the first line of the structure's body
+                offset = parse_ptr_offset(member).unwrap_or(0);
+            }
+
+            if member.trim().starts_with("//") {
+                continue;
+            }
             // Create a new member with no templated fields
             members.push(Member::new(member, bv, None, None, &namespace_path)?);
         }
@@ -383,7 +393,7 @@ impl<'a> Structure {
         Ok(Self {
             name,
             members,
-            offset: 0,
+            offset,
             packed,
             namespace_path,
         })
@@ -403,7 +413,7 @@ impl<'a> Structure {
     pub fn new_from_members(
         name: String,
         members: Vec<Member>,
-        offset: u16,
+        offset: i64,
         namespace_path: Vec<String>,
     ) -> Self {
         Self {
@@ -422,9 +432,7 @@ impl<'a> Structure {
     ///
     /// # Returns
     /// `true` if the structure was successfully defined
-    /// TODO migrate definition
-    /// TODO warn and return false anything fails
-    pub fn define<'b>(&mut self, bv: &'a BinaryView) -> bool {
+    pub fn define<'b>(&mut self, bv: &'a BinaryView) -> Result<(), String> {
         let mut builder = StructureBuilder::new();
 
         // Set packed flag if the structure is packed
@@ -432,8 +440,13 @@ impl<'a> Structure {
             builder.packed(true);
         }
 
+        // Set pointer offset if specified
+        if self.offset != 0 {
+            builder.pointer_offset(self.offset);
+        }
+
         for m in self.members.iter_mut() {
-            m.define(None, &mut builder, bv);
+            m.define(None, &mut builder, bv)?;
         }
         let s = Type::structure(&builder.finalize());
         let full_name = self.get_full_name();
@@ -443,7 +456,7 @@ impl<'a> Structure {
             full_name
         );
         bv.define_user_type(&full_name, &s);
-        true
+        Ok(())
     }
 
     /// Gets the full name including namespace prefix
@@ -543,13 +556,13 @@ impl<'a> Class {
         // overrides).
         for line in body.lines() {
             let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
             // Check for end of vtable marker
             if line.contains("// ; end vtable") {
                 in_vtable = false;
+                continue;
+            }
+
+            if line.is_empty() || line.starts_with("//") {
                 continue;
             }
 
@@ -769,7 +782,7 @@ impl<'a> Class {
         base_class_vtable_name: &str,
         process_non_overriding: bool,
         bv: &'a BinaryView,
-    ) {
+    ) -> Result<(), String> {
         let mut remaining: Vec<(Member, Option<String>)> = vec![];
         for (method, override_info) in &self.vtable_methods {
             if let Member::Function { .. } = method {
@@ -782,14 +795,14 @@ impl<'a> Class {
                             Self::parse_override_offset(&override_str, base_class_vtable_name, bv)
                         {
                             // Override at specific offset
-                            method.define(Some(offset), vtable_builder, bv);
+                            method.define(Some(offset), vtable_builder, bv)?;
                             continue;
                         }
                     }
                     remaining.push((method.clone(), Some(override_str.clone())));
                 } else if process_non_overriding {
                     // No override, add to vtable only if processing non-overriding methods
-                    method.define(None, vtable_builder, bv);
+                    method.define(None, vtable_builder, bv)?;
                 } else {
                     remaining.push((method.clone(), override_info.clone()));
                 }
@@ -812,11 +825,12 @@ impl<'a> Class {
                             &b.ty.name().to_string(),
                             false, // Already added to the structure builder, don't add again
                             bv,
-                        );
+                        )?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Checks if an override string targets a specific base class
@@ -1087,7 +1101,7 @@ impl<'a> Class {
     ///
     /// # Returns
     /// `true` if the class was successfully defined
-    pub fn define(&mut self, bv: &'a BinaryView) -> bool {
+    pub fn define(&mut self, bv: &'a BinaryView) -> Result<(), String> {
         // Create separate vtables for overriding each base class's
         // Tuple of (new_vtable_name, inherited_vtable_name, offset)
         let mut vtable_names = Vec::new();
@@ -1099,7 +1113,7 @@ impl<'a> Class {
 
             for (method, _) in &self.vtable_methods {
                 if let Member::Function { .. } = method {
-                    method.define(None, &mut vtable_builder, bv);
+                    method.define(None, &mut vtable_builder, bv)?;
                 }
             }
 
@@ -1198,7 +1212,7 @@ impl<'a> Class {
                     &inherited_vtable_name,
                     i == 0, // Only process methods for the first base class
                     bv,
-                );
+                )?;
 
                 // Define the inherited vtable structure
                 let vtable_structure = Type::structure(&vtable_builder.finalize());
@@ -1215,69 +1229,6 @@ impl<'a> Class {
                     );
                 })
             }
-
-            // Create vtables for each base class (including indirect inheritance)
-            // for (i, (base_class, _offset)) in all_base_classes.iter().enumerate() {
-            //     // let base_vtable_name = if !self.base_classes.contains(base_class) {
-            //     //     // If this is a parent of a parent, override the top-level
-            //     //     // parent vtable's override of _its_ parent.
-            //     //     if let Some(inherited) = all_base_classes[0..=i]
-            //     //         .iter()
-            //     //         .rev()
-            //     //         .find(|(_, off)| *off != u64::MAX)
-            //     //     {
-            //     //         format!("{}_vtable_{}", self.name, inherited.0)
-            //     //     } else {
-            //     //         "".to_string()
-            //     //     }
-            //     // } else {
-            //     //     format!("{}_vtable", base_class)
-            //     // };
-            //     // if base_vtable_name.is_empty() {
-            //     //     continue;
-            //     // }
-            //     let vtable_name = format!("{}_vtable_{}", self.name, base_class);
-            //     let base_vtable_name = format!("{}_vtable", base_class);
-
-            //     let mut vtable_builder = StructureBuilder::new();
-
-            //     // Add base class vtable as base structure and set proper width
-            //     let mut base_vtable_width = 0u64;
-            //     if let Some(base_vtable_type_id) = bv.type_id_by_name(&base_vtable_name) {
-            //         let base_vtable_ref = NamedTypeReference::new_with_id(
-            //             NamedTypeReferenceClass::StructNamedTypeClass,
-            //             &base_vtable_type_id,
-            //             &base_vtable_name,
-            //         );
-
-            //         // Get the width of the base vtable.
-            //         if let Some(width) = get_type_width_by_name(&base_vtable_name, bv) {
-            //             base_vtable_width = width;
-            //         }
-
-            //         // Set the base structure in the new vtable
-            //         let base_struct = BaseStructure::new(base_vtable_ref, 0, base_vtable_width);
-            //         vtable_builder.base_structures(&[base_struct]);
-
-            //         // Set the vtable builder width to account for the base vtable
-            //         vtable_builder.width(base_vtable_width);
-            //     }
-
-            //     // Process vtable methods for this base class. Handles overrides and adding
-            //     // the class-specific methods to the vtable if this is the first base class
-            //     Self::process_vtable_methods_for_base(
-            //         &self.vtable_methods,
-            //         &mut vtable_builder,
-            //         base_class,
-            //         i == 0, // Only process methods for the first base class
-            //         bv,
-            //     );
-
-            //     // Define the inherited vtable structure
-            //     let vtable_structure = Type::structure(&vtable_builder.finalize());
-            //     bv.define_user_type(&vtable_name, &vtable_structure);
-            //     vtable_names.push(vtable_name);
-            // }
         }
 
         log::info!("Got vtable names and offsets: {:#x?}", vtable_names);
@@ -1316,12 +1267,7 @@ impl<'a> Class {
 
         // Step 2: Insert vtables.
         // This includes overriding inherited class vtables (including indirect inheritance)
-        // if !self.base_classes.is_empty() {
-        // let all_base_classes = self.collect_all_base_classes(bv);
-
-        // for (i, (base_class, offset)) in all_base_classes.iter().enumerate() {
         for (vtable_name, offset) in vtable_names {
-            // if let Some(vtable_name) = vtable_names.get(i) {
             // Create vtable pointer
             let vtable_ptr = Type::pointer(
                 &bv.default_arch().expect("Could not find default arch"),
@@ -1346,26 +1292,6 @@ impl<'a> Class {
             );
             // }
         }
-        // } else if !self.vtable_methods.is_empty() {
-        //     // Regular class with vtable - insert at offset 0
-        //     if let Some(vtable_name) = vtable_names.get(0) {
-        //         let vtable_ptr = Type::pointer(
-        //             &bv.default_arch().expect("Could not find default arch"),
-        //             &Type::named_type(&NamedTypeReference::new(
-        //                 NamedTypeReferenceClass::StructNamedTypeClass,
-        //                 vtable_name,
-        //             )),
-        //         );
-        //         class_builder.insert(
-        //             vtable_ptr.as_ref(),
-        //             "vtable",
-        //             0,
-        //             true, // overwrite existing
-        //             MemberAccess::PublicAccess,
-        //             MemberScope::NoScope,
-        //         );
-        //     }
-        // }
 
         // Step 3: Handle member variable overrides and add member variables specific to this class
         let all_base_classes = self.collect_all_base_classes(bv);
@@ -1387,13 +1313,13 @@ impl<'a> Class {
                     log::debug!("Found override for {override_str} at offset {base_offset:x}");
 
                     // Insert the overriding member at the calculated offset
-                    member.define(Some(base_offset), &mut class_builder, bv);
+                    member.define(Some(base_offset), &mut class_builder, bv)?;
                     continue;
                 }
             }
 
             // No override, append normally
-            member.define(None, &mut class_builder, bv);
+            member.define(None, &mut class_builder, bv)?;
         }
 
         // Define the class structure
@@ -1401,7 +1327,7 @@ impl<'a> Class {
         let full_name = self.get_full_name();
         bv.define_user_type(&full_name, &class_structure);
 
-        true
+        Ok(())
     }
 
     /// Gets the full name including namespace prefix
@@ -1707,7 +1633,6 @@ impl<'a> Member {
                 });
             } else {
                 // Not a function definition
-                // TODO turn expect into error
                 let (typ, name, depth, arrsize) =
                     parse_member_definition(&def).expect(&format!("Could not parse {def}"));
                 let typ = Self::define_type_with_namespace(&typ, depth, bv, current_namespace)?;
@@ -1736,7 +1661,7 @@ impl<'a> Member {
         offset: Option<u64>,
         builder: &mut StructureBuilder,
         bv: &'a BinaryView,
-    ) {
+    ) -> Result<(), String> {
         match self {
             Member::Basic {
                 name,
@@ -1805,7 +1730,7 @@ impl<'a> Member {
                 // TODO include variable arguments
                 let func = Type::function(ret.as_ref(), v, false);
                 let func = Type::pointer(
-                    &bv.default_arch().expect("Could not find default arch"),
+                    &bv.default_arch().ok_or("Could not find default arch")?,
                     func.as_ref(),
                 );
                 if let Some(o) = offset {
@@ -1827,6 +1752,7 @@ impl<'a> Member {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1997,6 +1923,31 @@ fn parse_name(def: &str) -> Option<String> {
     }
 
     Some(s.to_string())
+}
+
+/// Parses the __ptr_offset(X) directive from a structure definition
+///
+/// # Arguments
+/// * `def` - The structure definition string
+///
+/// # Returns
+/// The parsed offset value as u16, or None if not found
+fn parse_ptr_offset(def: &str) -> Option<i64> {
+    use regex::Regex;
+
+    let re = Regex::new(r"__ptr_offset\((-?0x[0-9a-fA-F]+|-?\d+)\)").ok()?;
+    let captures = re.captures(def)?;
+    let offset_str = captures.get(1)?.as_str();
+
+    // Parse decimal or hexadecimal
+    if offset_str.starts_with("0x") || offset_str.starts_with("0X") {
+        i64::from_str_radix(&offset_str[2..], 16).ok()
+    } else if offset_str.starts_with("-0x") || offset_str.starts_with("-0X") {
+        let res = i64::from_str_radix(&offset_str[3..], 16).ok()?;
+        return Some(-res);
+    } else {
+        offset_str.parse::<i64>().ok()
+    }
 }
 
 /// Determines the pointer depth and extracts the suffix from a type definition
@@ -2222,7 +2173,7 @@ impl<'a> Parser<'a> {
                 idx += i + 1;
                 log::info!("Handling line: {}, {}, {}", i, s, c);
                 // base case
-                if i == 0 {
+                if i == 0 && c == ';' {
                     continue;
                 }
                 // structure, template, class definition
@@ -2338,7 +2289,7 @@ impl<'a> Parser<'a> {
                             log::info!("Got struct {}: {}", s, s2);
                             let mut structure =
                                 Structure::new(s, s2, self.bv, self.get_current_namespace_path())?;
-                            structure.define(self.bv);
+                            structure.define(self.bv)?;
                             idx += i2 + 1;
                         } else if s.starts_with("class") {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
@@ -2347,7 +2298,7 @@ impl<'a> Parser<'a> {
                             log::debug!("Got class {}: {}", s, s2);
                             let mut class =
                                 Class::new(s, s2, self.bv, self.get_current_namespace_path())?;
-                            class.define(self.bv);
+                            class.define(self.bv)?;
                             idx += i2 + 1;
                         } else if s.starts_with("enum") {
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
@@ -2383,7 +2334,7 @@ impl<'a> Parser<'a> {
                             log::info!("Got enum {} with size {}", enum_name, size);
                             let enum_def =
                                 Enum::new(enum_name, size, s2, self.get_current_namespace_path());
-                            enum_def.define(self.bv);
+                            enum_def.define(self.bv)?;
 
                             idx += i2 + 1;
                         } else {
@@ -2676,7 +2627,7 @@ mod tests {
         // Define struct2_name as a basic struct
         let mut basic_struct =
             Structure::new("struct2_name", "int32_t x;", bv.as_ref(), Vec::new()).unwrap();
-        basic_struct.define(bv.as_ref());
+        assert!(basic_struct.define(bv.as_ref()).is_ok());
         assert_eq!(get_type_width_by_name(&"struct2_name", &bv), Some(4));
 
         // Define class_name as a basic struct
@@ -2687,7 +2638,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        class_struct.define(bv.as_ref());
+        assert!(class_struct.define(bv.as_ref()).is_ok());
         assert_eq!(get_type_width_by_name(&"class_name", &bv), Some(8));
 
         // Define a simple template structure
@@ -2918,7 +2869,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        regular_struct.define(bv.as_ref());
+        assert!(regular_struct.define(bv.as_ref()).is_ok());
 
         // Create a packed structure without padding
         let packed_struct_def = "struct __attribute__((packed)) PackedStruct";
@@ -2930,7 +2881,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        packed_struct.define(bv.as_ref());
+        assert!(packed_struct.define(bv.as_ref()).is_ok());
 
         // Verify the packed flag was set correctly
         assert!(
@@ -2980,6 +2931,73 @@ mod tests {
     }
 
     #[test]
+    fn test_structure_offset() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        let name = "struct __attribute__((packed)) MyStruct";
+        assert_eq!(parse_name(name), Some("MyStruct".to_string()));
+
+        let mut s = Structure::new(
+            name,
+            r#"// ; __ptr_offset(0x10)
+void* a[0x10];
+int64_t b;
+char c"#,
+            bv.as_ref(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut s2 = Structure::new(
+            name,
+            r#"// ; __ptr_offset(24)
+void* a[4];
+uint64_t b;
+char* c"#,
+            bv.as_ref(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut s3 = Structure::new(
+            name,
+            r#"// ; __ptr_offset(-0x10)
+void* a[4];
+uint64_t b;
+char* c"#,
+            bv.as_ref(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut s4 = Structure::new(
+            name,
+            r#"// ; __ptr_offset(-24)
+void* a[4];
+uint64_t b;
+char* c"#,
+            bv.as_ref(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(s.define(&bv).is_ok());
+        assert!(s2.define(&bv).is_ok());
+        assert!(s3.define(&bv).is_ok());
+        assert!(s4.define(&bv).is_ok());
+
+        // The Rust API does not allow validating the structure's pointer offset
+        // after declaration. Instead, just validate prior to definition
+        assert_eq!(s.offset, 0x10);
+        assert_eq!(s2.offset, 0x18);
+        assert_eq!(s3.offset, -0x10);
+        assert_eq!(s4.offset, -0x18);
+    }
+
+    #[test]
     fn test_array_members() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("test.bndb");
@@ -2996,7 +3014,7 @@ uint32_t c[0x8];"#,
             Vec::new(),
         )
         .unwrap();
-        base_struct.define(bv.as_ref());
+        assert!(base_struct.define(bv.as_ref()).is_ok());
 
         assert_eq!(get_type_width_by_name("ArrayStruct", &bv), Some(0x38));
         let base_type = get_type_by_name("ArrayStruct", &bv).unwrap();
@@ -3037,7 +3055,7 @@ int32_t c[0x8];"#,
             Vec::new(),
         )
         .unwrap();
-        nested_struct.define(bv.as_ref());
+        assert!(nested_struct.define(bv.as_ref()).is_ok());
 
         assert_eq!(
             get_type_width_by_name("ArrayStruct2", &bv),
@@ -3123,7 +3141,7 @@ int32_t c[0x8];"#,
             Vec::new(),
         )
         .unwrap();
-        global_struct.define(bv.as_ref());
+        assert!(global_struct.define(bv.as_ref()).is_ok());
 
         let mut qqq_struct = Structure::new(
             "struct aaa",
@@ -3132,7 +3150,7 @@ int32_t c[0x8];"#,
             vec!["QQQ".to_string()],
         )
         .unwrap();
-        qqq_struct.define(bv.as_ref());
+        assert!(qqq_struct.define(bv.as_ref()).is_ok());
 
         let mut rrr_struct = Structure::new(
             "struct aaa",
@@ -3141,7 +3159,7 @@ int32_t c[0x8];"#,
             vec!["QQQ".to_string(), "RRR".to_string()],
         )
         .unwrap();
-        rrr_struct.define(bv.as_ref());
+        assert!(rrr_struct.define(bv.as_ref()).is_ok());
 
         // Test get_full_name functionality
         assert_eq!(global_struct.get_full_name(), "aaa");
@@ -3169,7 +3187,7 @@ int32_t c[0x8];"#,
         // Define types in different namespaces
         let mut global_struct =
             Structure::new("struct TestType", "int32_t x;", bv.as_ref(), Vec::new()).unwrap();
-        global_struct.define(bv.as_ref());
+        assert!(global_struct.define(bv.as_ref()).is_ok());
 
         let mut ns_struct = Structure::new(
             "struct TestType",
@@ -3178,7 +3196,7 @@ int32_t c[0x8];"#,
             vec!["NS".to_string()],
         )
         .unwrap();
-        ns_struct.define(bv.as_ref());
+        assert!(ns_struct.define(bv.as_ref()).is_ok());
 
         // Test type resolution from different namespace contexts
         let global_context = Vec::new();
@@ -3218,7 +3236,7 @@ int32_t c[0x8];"#,
             vec!["TestNS".to_string()],
         )
         .unwrap();
-        ns_struct.define(bv.as_ref());
+        assert!(ns_struct.define(bv.as_ref()).is_ok());
 
         // Create a member that references this type from within the same namespace
         let member = Member::new(
@@ -3248,7 +3266,7 @@ int32_t c[0x8];"#,
 
         // Define enums in different namespaces
         let global_enum = Enum::new("GlobalEnum", 4, "VALUE1,\nVALUE2,\nVALUE3", Vec::new());
-        global_enum.define(bv.as_ref());
+        assert!(global_enum.define(bv.as_ref()).is_ok());
 
         let ns_enum = Enum::new(
             "GlobalEnum",
@@ -3256,7 +3274,7 @@ int32_t c[0x8];"#,
             "NS_VALUE1,\nNS_VALUE2",
             vec!["MyNS".to_string()],
         );
-        ns_enum.define(bv.as_ref());
+        assert!(ns_enum.define(bv.as_ref()).is_ok());
 
         // Test get_full_name functionality for enums
         assert_eq!(global_enum.get_full_name(), "GlobalEnum");
@@ -3326,7 +3344,7 @@ int32_t c[0x8];"#,
             Vec::new(),
         )
         .unwrap();
-        global_class.define(bv.as_ref());
+        assert!(global_class.define(bv.as_ref()).is_ok());
 
         let mut ns_class = Class::new(
             "class MyClass",
@@ -3335,7 +3353,7 @@ int32_t c[0x8];"#,
             vec!["Services".to_string()],
         )
         .unwrap();
-        ns_class.define(bv.as_ref());
+        assert!(ns_class.define(bv.as_ref()).is_ok());
 
         // Test get_full_name functionality for classes
         assert_eq!(global_class.get_full_name(), "MyClass");
@@ -3416,7 +3434,7 @@ int32_t base_member;"#,
             Vec::new(),
         )
         .unwrap();
-        base_class.define(bv.as_ref());
+        assert!(base_class.define(bv.as_ref()).is_ok());
 
         // Define middle class that inherits from BaseClass and overrides some methods
         let mut middle_class = Class::new(
@@ -3431,7 +3449,7 @@ int64_t middle_member;"#,
             Vec::new(),
         )
         .unwrap();
-        middle_class.define(bv.as_ref());
+        assert!(middle_class.define(bv.as_ref()).is_ok());
 
         // Define derived class that inherits from MiddleClass and overrides more methods
         let mut derived_class = Class::new(
@@ -3447,7 +3465,7 @@ uint32_t derived_member;"#,
             Vec::new(),
         )
         .unwrap();
-        derived_class.define(bv.as_ref());
+        assert!(derived_class.define(bv.as_ref()).is_ok());
 
         // Verify all classes are defined
         assert!(bv.type_id_by_name("BaseClass").is_some());
@@ -3697,7 +3715,7 @@ int32_t base_int;"#,
             Vec::new(),
         )
         .unwrap();
-        base_class.define(bv.as_ref());
+        assert!(base_class.define(bv.as_ref()).is_ok());
 
         // Define middle class with additional members and member override
         let mut middle_class = Class::new(
@@ -3712,7 +3730,7 @@ uint32_t base_int; // ; override int32_t MemberBase::base_int;"#,
             Vec::new(),
         )
         .unwrap();
-        middle_class.define(bv.as_ref());
+        assert!(middle_class.define(bv.as_ref()).is_ok());
 
         // Define derived class with more members and another override
         let mut derived_class = Class::new(
@@ -3728,7 +3746,7 @@ uint64_t middle_ptr; // ; override void* MemberMiddle::middle_ptr;"#,
             Vec::new(),
         )
         .unwrap();
-        derived_class.define(bv.as_ref());
+        assert!(derived_class.define(bv.as_ref()).is_ok());
 
         // Verify class sizes include inherited members
         let base_size = get_type_width_by_name("MemberBase", &bv).expect("Base class size");
@@ -3960,7 +3978,7 @@ int32_t base1_member2"#,
             Vec::new(),
         )
         .unwrap();
-        base1.define(bv.as_ref());
+        assert!(base1.define(bv.as_ref()).is_ok());
 
         let mut base2 = Class::new(
             "class Base2",
@@ -3973,7 +3991,7 @@ int64_t base2_member;"#,
             Vec::new(),
         )
         .unwrap();
-        base2.define(bv.as_ref());
+        assert!(base2.define(bv.as_ref()).is_ok());
 
         let mut base3 = Class::new(
             "class Base3",
@@ -3987,7 +4005,7 @@ uint32_t base3_member2"#,
             Vec::new(),
         )
         .unwrap();
-        base3.define(bv.as_ref());
+        assert!(base3.define(bv.as_ref()).is_ok());
 
         let mut base4 = Class::new(
             "class Base4",
@@ -4000,7 +4018,7 @@ uint64_t base4_member;"#,
             Vec::new(),
         )
         .unwrap();
-        base4.define(bv.as_ref());
+        assert!(base4.define(bv.as_ref()).is_ok());
 
         // Define middle class with multiple inheritance (using test.hpp syntax)
         let mut middle1 = Class::new(
@@ -4018,7 +4036,7 @@ uint64_t middle1_member;"#,
             Vec::new(),
         )
         .unwrap();
-        middle1.define(bv.as_ref());
+        assert!(middle1.define(bv.as_ref()).is_ok());
 
         let mut middle2 = Class::new(
             "class MultiMiddle2 : Base3, Base4",
@@ -4034,7 +4052,7 @@ int64_t middle2_member;"#,
             Vec::new(),
         )
         .unwrap();
-        middle2.define(bv.as_ref());
+        assert!(middle2.define(bv.as_ref()).is_ok());
 
         // Define derived class inheriting from multiple inheritance middle class
         let mut derived = Class::new(
@@ -4057,7 +4075,7 @@ bool derived_member;"#,
             Vec::new(),
         )
         .unwrap();
-        derived.define(bv.as_ref());
+        assert!(derived.define(bv.as_ref()).is_ok());
 
         // Verify inheritance relationships
         assert_eq!(middle1.base_classes.len(), 2);
@@ -4479,7 +4497,7 @@ int8_t level1_data;"#,
             Vec::new(),
         )
         .unwrap();
-        level1.define(bv.as_ref());
+        assert!(level1.define(bv.as_ref()).is_ok());
 
         let mut level2 = Class::new(
             "class Level2 : Level1",
@@ -4493,7 +4511,7 @@ int16_t level2_data;"#,
             Vec::new(),
         )
         .unwrap();
-        level2.define(bv.as_ref());
+        assert!(level2.define(bv.as_ref()).is_ok());
 
         let mut level3 = Class::new(
             "class Level3 : Level2",
@@ -4507,7 +4525,7 @@ int32_t level3_data;"#,
             Vec::new(),
         )
         .unwrap();
-        level3.define(bv.as_ref());
+        assert!(level3.define(bv.as_ref()).is_ok());
 
         let mut level4 = Class::new(
             "class Level4 : Level3",
@@ -4521,7 +4539,7 @@ int64_t level4_data;"#,
             Vec::new(),
         )
         .unwrap();
-        level4.define(bv.as_ref());
+        assert!(level4.define(bv.as_ref()).is_ok());
 
         // Verify inheritance chain
         assert_eq!(level1.base_classes.len(), 0);
