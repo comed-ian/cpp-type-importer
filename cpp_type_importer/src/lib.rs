@@ -14,10 +14,9 @@ use std::io::Read;
 use std::path::PathBuf;
 
 // TODO
-// 1. Templated Typedefs
-// 2. Conflicting vtable function names (e.g., MyMethod)
-// 3. Add comment lines to middle of structure and class
-// 4. Handle /* */
+// 1. Conflicting vtable function names (e.g., MyMethod)
+// 2. Add comment lines to middle of structure and class
+// 3. Handle /* */
 /// Maps C++ primitive type names to Binary Ninja types
 ///
 /// # Arguments
@@ -245,24 +244,43 @@ impl<'a> Typedef {
     }
 }
 
-/// Represents a C++ template definition with type parameters
-///
-/// This structure stores the template name, parameter names, and body content
-/// to support template instantiation with concrete types.
+/// Represents different types of C++ templates
 #[derive(Debug, Clone)]
-pub struct Template {
-    /// The name of the template (e.g., "vector" for std::vector)
-    name: String,
-    /// List of template parameter names (e.g., ["T", "Allocator"])
-    typenames: Vec<String>,
-    /// The template body containing member definitions
-    body: String,
-    /// Namespace path for this template
-    namespace_path: Vec<String>,
+pub enum Template {
+    /// Regular template with a body (struct/class template)
+    StructTemplate {
+        /// The name of the template (e.g., "vector" for std::vector)
+        name: String,
+        /// List of template parameter names (e.g., ["T", "Allocator"])
+        typenames: Vec<String>,
+        /// The template body containing member definitions
+        body: String,
+        /// Namespace path for this template
+        namespace_path: Vec<String>,
+    },
+    /// Templated typedef (using statement) like `template <typename T> using AA = Abc<T, uint32_t>;`
+    TypedefTemplate {
+        /// The name of the templated typedef (e.g., "AA")
+        name: String,
+        /// List of template parameter names (e.g., ["T"])
+        typenames: Vec<String>,
+        /// The base template name being aliased (e.g., "Abc")
+        target_template_name: String,
+        /// Templated parameters: (target_index, template_param_name)
+        /// e.g., for Abc<T, uint32_t> where T is templated: [(0, "T")]
+        /// e.g., for Abc<uint32_t, T> where T is templated: [(1, "T")]
+        templated_parameters: Vec<(usize, String)>,
+        /// Concrete parameters: (target_index, concrete_type)
+        /// e.g., for Abc<T, uint32_t> where uint32_t is concrete: [(1, "uint32_t")]
+        /// e.g., for Abc<uint32_t, T> where uint32_t is concrete: [(0, "uint32_t")]
+        concrete_parameters: Vec<(usize, String)>,
+        /// Namespace path for this templated typedef
+        namespace_path: Vec<String>,
+    },
 }
 
 impl<'a> Template {
-    /// Creates a new template from its definition
+    /// Creates a new struct template from its definition
     ///
     /// # Arguments
     /// * `def` - The template declaration line, like `template template_name`
@@ -271,10 +289,10 @@ impl<'a> Template {
     /// * `typenames` - List of template parameter names parsed from the definition line
     ///
     /// # Returns
-    /// A new `Template` instance
+    /// A new `Template::StructTemplate` instance
     pub fn new(def: &str, body: &str, typenames: Vec<String>, namespace_path: Vec<String>) -> Self {
         let name = parse_name(def).expect(&format!("Could not parse name from {def}"));
-        Self {
+        Template::StructTemplate {
             name,
             typenames,
             body: body.to_string(),
@@ -282,54 +300,176 @@ impl<'a> Template {
         }
     }
 
+    /// Creates a new typedef template from its definition
+    ///
+    /// # Arguments
+    /// * `name` - The typedef name (e.g., "AA")
+    /// * `typenames` - List of template parameter names (e.g., ["T"])
+    /// * `target_template_name` - The base template name (e.g., "Abc")
+    /// * `templated_parameters` - Templated parameters with positions
+    /// * `concrete_parameters` - Concrete parameters with positions
+    /// * `namespace_path` - Namespace path for this typedef
+    ///
+    /// # Returns
+    /// A new `Template::TypedefTemplate` instance
+    pub fn new_typedef(
+        name: String,
+        typenames: Vec<String>,
+        target_template_name: String,
+        templated_parameters: Vec<(usize, String)>,
+        concrete_parameters: Vec<(usize, String)>,
+        namespace_path: Vec<String>,
+    ) -> Self {
+        Template::TypedefTemplate {
+            name,
+            typenames,
+            target_template_name,
+            templated_parameters,
+            concrete_parameters,
+            namespace_path,
+        }
+    }
+
+    /// Gets the template name
+    pub fn get_name(&self) -> &str {
+        match self {
+            Template::StructTemplate { name, .. } => name,
+            Template::TypedefTemplate { name, .. } => name,
+        }
+    }
+
     /// Instantiates the template with concrete types in Binary Ninja
     ///
     /// # Arguments
-    /// * `typenames` - Concrete type names to substitute for template parameters,
-    /// ordered according to the required substitution order in `self.typenames`
+    /// * `typenames` - Concrete type names to substitute for template parameters
     /// * `bv` - Binary Ninja binary view reference
-    ///
-    /// # Panics
-    /// Panics if the number of provided type names doest not match template parameters
+    /// * `templates` - Reference to all templates for typedef resolution
+    /// * `typedef_name` - Optional name for typedef templates (e.g., "AA" instead of "Abc")
     pub fn define<'b>(&self, typenames: Vec<String>, bv: &'a BinaryView) -> Result<(), String> {
-        assert_eq!(
-            typenames.len(),
-            self.typenames.len(),
-            "Provided typenames length does not match expected typenames length"
-        );
-        let mut members = Vec::<Member>::new();
-        for member in self.body.lines() {
-            if member.trim() == "" {
-                continue;
+        match self {
+            Template::StructTemplate {
+                name,
+                typenames: template_params,
+                body,
+                namespace_path,
+            } => {
+                if typenames.len() != template_params.len() {
+                    return Err(
+                        "Provided typenames length does not match expected typenames length"
+                            .to_string(),
+                    );
+                }
+                let mut members = Vec::<Member>::new();
+                for member in body.lines() {
+                    if member.trim() == "" {
+                        continue;
+                    }
+                    log::debug!("Defining member: {}", member);
+                    // Create a new member and provide the typenames to swap in case
+                    // the given member uses a typename
+                    members.push(Member::new(
+                        member,
+                        bv,
+                        Some(template_params),
+                        Some(&typenames),
+                        namespace_path,
+                    )?);
+                }
+                let instantiated_name = format!("{name}<{}>", typenames.join(", "));
+                Structure::new_from_members(instantiated_name, members, 0, namespace_path.clone())
+                    .define(bv)?;
+                Ok(())
             }
-            log::debug!("Defining member: {}", member);
-            // Create a new member and provide the typenames to swap in case
-            // the given member uses a typename
-            members.push(Member::new(
-                member,
-                bv,
-                Some(&self.typenames),
-                Some(&typenames),
-                &self.namespace_path,
-            )?);
+            Template::TypedefTemplate {
+                name,
+                typenames: template_params,
+                target_template_name,
+                templated_parameters,
+                concrete_parameters,
+                ..
+            } => {
+                if typenames.len() != template_params.len() {
+                    return Err(
+                        "Provided typenames length does not match expected typenames length"
+                            .to_string(),
+                    );
+                }
+
+                // Build the parameter list for the target template
+                let max_index = templated_parameters
+                    .iter()
+                    .chain(concrete_parameters.iter())
+                    .map(|(idx, _)| *idx)
+                    .max()
+                    .unwrap_or(0);
+
+                let mut target_typenames = vec![String::new(); max_index + 1];
+
+                // Fill in concrete parameters
+                for (idx, concrete_type) in concrete_parameters {
+                    target_typenames[*idx] = concrete_type.clone();
+                }
+
+                // Fill in templated parameters by substituting from our typenames
+                for (idx, template_param) in templated_parameters {
+                    if let Some(param_idx) =
+                        template_params.iter().position(|p| p == template_param)
+                    {
+                        target_typenames[*idx] = typenames[param_idx].clone();
+                    } else {
+                        return Err(format!(
+                            "Template parameter {} not found in typedef template {}",
+                            template_param, name
+                        ));
+                    }
+                }
+
+                log::info!(
+                    "Instantiating {} with parameters: {:?}",
+                    target_template_name,
+                    target_typenames
+                );
+
+                let full_typename =
+                    format!("{target_template_name}<{}>", target_typenames.join(", "));
+                let full_name = format!("{}<{}>", self.get_full_name(), typenames.join(", "));
+                let typ = get_non_primitive_type_by_name(&full_typename, bv).ok_or(format!(
+                    "Could not find type {} for templated typedef definition",
+                    full_typename
+                ))?;
+
+                bv.define_user_type(&full_name, &typ);
+
+                Ok(())
+            }
         }
-        // `self.name` is simply the name of the templated structure. Add
-        // `<typename1, typename2, ...>` to distinguish this particular
-        // instantiation.
-        let mut name = self.name.clone();
-        name.push('<');
-        name.push_str(&typenames.join(", "));
-        name.push('>');
-        Structure::new_from_members(name, members, 0, self.namespace_path.clone()).define(bv)?;
-        Ok(())
     }
 
     /// Gets the full name including namespace prefix
     fn get_full_name(&self) -> String {
-        if self.namespace_path.is_empty() {
-            self.name.clone()
-        } else {
-            format!("{}::{}", self.namespace_path.join("::"), self.name)
+        match self {
+            Template::StructTemplate {
+                name,
+                namespace_path,
+                ..
+            } => {
+                if namespace_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", namespace_path.join("::"), name)
+                }
+            }
+            Template::TypedefTemplate {
+                name,
+                namespace_path,
+                ..
+            } => {
+                if namespace_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", namespace_path.join("::"), name)
+                }
+            }
         }
     }
 }
@@ -689,7 +829,7 @@ impl<'a> Class {
                 // Parse all parameters first
                 let mut all_params = if params_str.is_empty() {
                     Vec::new()
-                } else if let Some(params) = parse_template_instantiation(params_str) {
+                } else if let Some(params) = parse_template_instantiation(params_str)? {
                     params
                 } else {
                     // Fallback to simple splitting if parsing fails
@@ -727,7 +867,7 @@ impl<'a> Class {
             // Parse all parameters first
             let mut all_params = if params_str.is_empty() {
                 Vec::new()
-            } else if let Some(params) = parse_template_instantiation(params_str) {
+            } else if let Some(params) = parse_template_instantiation(params_str)? {
                 params
             } else {
                 // Fallback to simple splitting if parsing fails
@@ -832,24 +972,6 @@ impl<'a> Class {
         }
         Ok(())
     }
-
-    /// Checks if an override string targets a specific base class
-    ///
-    /// # Arguments
-    /// * `override_str` - The override specification string, like
-    /// `void (* base_vtable::fn)(struct base* this);`
-    /// * `base_class` - The base class name to check
-    ///
-    /// # Returns
-    /// `true` if the override targets the base class
-    /// TODO what about multiple levels of inheritance
-    // fn is_override_for_base_class(override_str: &str, base_class: &str) -> bool {
-    //     // Check if the override string contains the base class vtable name
-    //     let base_vtable_name = format!("{}_vtable", base_class);
-    //     let base_vtable_name_inherited = format!("vtable_{}", base_class);
-    //     override_str.contains(&base_vtable_name)
-    //         || override_str.contains(&base_vtable_name_inherited)
-    // }
 
     /// Parses the offset for a method override in a base class virtual table
     ///
@@ -1609,8 +1731,8 @@ impl<'a> Member {
                 // TODO allow [] in arguments to function
                 let (return_type, _, depth, _) = parse_member_definition(return_type)
                     .expect("Could not parse function member return type");
-                let args = parse_template_instantiation(args)
-                    .expect("Could not parse function member args");
+                let args = parse_template_instantiation(args)?
+                    .ok_or("Could not parse function member args".to_string())?;
                 let mut defined_args = vec![];
                 for a in args {
                     let (typ, name, depth, _) = parse_member_definition(&a)
@@ -1800,7 +1922,7 @@ fn parse_template_member_definition(s: &str) -> Vec<String> {
 ///
 /// # Returns
 /// `Some(Vec<String>)` with parsed type arguments, `None` if parsing fails
-fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
+fn parse_template_instantiation(s: &str) -> Result<Option<Vec<String>>, String> {
     let mut curr = String::new();
     let mut typenames = Vec::<String>::new();
     let mut stack = vec![];
@@ -1838,10 +1960,9 @@ fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
         curr.push(c);
     }
 
-    assert!(
-        stack.is_empty(),
-        "Could not find balanced < and > in template instantiation"
-    );
+    if !stack.is_empty() {
+        return Err("Could not find balanced < and > in template instantiation".to_string());
+    }
 
     // get last item if not empty
     let curr = curr.trim().to_string();
@@ -1849,7 +1970,7 @@ fn parse_template_instantiation(s: &str) -> Option<Vec<String>> {
         typenames.push(curr);
     }
 
-    Some(typenames)
+    Ok(Some(typenames))
 }
 
 /// Parses template parameter names from template definition
@@ -1887,6 +2008,45 @@ fn parse_template_definition(s: &str) -> Option<Vec<String>> {
     }
 
     Some(typenames)
+}
+
+/// Parses a templated typedef assignment like "AA = Abc<T, uint32_t>"
+///
+/// Extracts the typedef name, target template name, and template parameters
+/// from assignment statements used in templated typedef declarations.
+///
+/// # Arguments
+/// * `s` - The assignment string, e.g., "AA = Abc<T, uint32_t>"
+///
+/// # Returns
+/// `Ok(Some((typedef_name, target_template_name, template_params)))` if parsing succeeds, `None` if it fails
+fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<String>)>, String> {
+    // Find the '=' separator
+    let parts: Vec<&str> = s.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        return Err("Could not find = in typedef assignment".to_string());
+    }
+
+    let typedef_name = parts[0].trim().to_string();
+    let target_type = parts[1].trim();
+
+    // Parse the target type to extract template name and parameters
+    if let Some(start) = target_type.find('<') {
+        let template_name = target_type[..start].trim().to_string();
+        let end = target_type
+            .rfind('>')
+            .ok_or("Could not find closing > in typedef assignment".to_string())?;
+        let params_str = &target_type[start + 1..end];
+
+        // Use existing function to parse template parameters
+        let template_params = parse_template_instantiation(params_str)?
+            .ok_or("Could not parse template instantiation in typedef assignment".to_string())?;
+
+        Ok(Some((typedef_name, template_name, template_params)))
+    } else {
+        // Non-templated target (shouldn't happen for templated typedefs, but handle gracefully)
+        Err("Could not find starting < in typedef assignment".to_string())
+    }
 }
 
 /// Parses the name from a class, struct, template, or enum definition
@@ -2183,7 +2343,11 @@ impl<'a> Parser<'a> {
                         .ok_or("Could not find closing token".to_string())?;
                     s2 = s2.trim();
                     // throw out include statements
-                    assert!(c == '<' || c == '"');
+                    if c != '<' && c != '"' {
+                        return Err(
+                            "Could not find opening < or \" in include statement".to_string()
+                        );
+                    }
                     log::info!("Skipping line: {} {}", s, s2);
                     idx += i2 + 1;
                     continue;
@@ -2210,20 +2374,70 @@ impl<'a> Parser<'a> {
                                 .expect(&format!("Could not parse template definitions {s2}"));
                             let (i3, c3, s3) = find_next_token(&contents[idx + i2 + 1..])
                                 .ok_or("Could not find closing token for template definition")?;
-                            assert!(c3 == '{');
-                            log::info!("Got template name: {}", s3);
-                            let (i4, _, body) =
-                                find_closing_token(&contents[idx + i2 + i3 + 2..], c3)
-                                    .ok_or("Could not find closing token")?;
-                            log::info!("Got template definition: {}", body);
-                            idx += i3 + i4 + 2;
-                            let t = Template::new(
-                                s3,
-                                body,
-                                typenames,
-                                self.get_current_namespace_path(),
-                            );
-                            templates.push(t);
+
+                            if s3.trim().starts_with("using") {
+                                // Templated typedef: template <...> using AA = Abc<T, uint32_t>;
+                                // Find the closing ';' specifically
+                                let (i4, _, s4) =
+                                    find_closing_token(&contents[idx + i2 + i3 + 1..], ';').ok_or(
+                                        "Could not find closing semicolon for templated typedef",
+                                    )?;
+                                let full_using_statement = format!("{}{}", s3, s4);
+                                log::info!("Got templated typedef: {}", full_using_statement);
+
+                                // Strip "using " from the front and parse the assignment
+                                let assignment_string =
+                                    full_using_statement.trim().strip_prefix("using ").unwrap();
+                                let (typedef_name, template_name, target_params) =
+                                    parse_typedef_assignment(assignment_string)?
+                                        .ok_or("Could not parse templated typedef assignment")?;
+
+                                // Separate templated parameters from concrete parameters
+                                let mut templated_parameters = Vec::new();
+                                let mut concrete_parameters = Vec::new();
+
+                                for (idx, param) in target_params.iter().enumerate() {
+                                    let param = param.trim();
+                                    if typenames.contains(&param.to_string()) {
+                                        templated_parameters.push((idx, param.to_string()));
+                                    } else {
+                                        concrete_parameters.push((idx, param.to_string()));
+                                    }
+                                }
+
+                                let t = Template::new_typedef(
+                                    typedef_name,
+                                    typenames.clone(),
+                                    template_name,
+                                    templated_parameters,
+                                    concrete_parameters,
+                                    self.get_current_namespace_path(),
+                                );
+                                templates.push(t);
+
+                                idx += i3 + i4 + 2;
+                            } else if c3 == '{' {
+                                // Regular struct/class template
+                                log::info!("Got template name: {}", s3);
+                                let (i4, _, body) =
+                                    find_closing_token(&contents[idx + i2 + i3 + 2..], c3)
+                                        .ok_or("Could not find closing token")?;
+                                log::info!("Got template definition: {}", body);
+                                idx += i3 + i4 + 2;
+                                let t = Template::new(
+                                    s3,
+                                    body,
+                                    typenames,
+                                    self.get_current_namespace_path(),
+                                );
+                                templates.push(t);
+                            } else {
+                                // Unknown template pattern, skip it
+                                return Err(format!(
+                                    "Unknown template pattern: s3='{}', c3='{}'",
+                                    s3, c3
+                                ));
+                            }
                             idx += i2 + 1;
                         } else {
                             // s looks like `struct_name<` or `typedef struct_name<`.
@@ -2246,12 +2460,12 @@ impl<'a> Parser<'a> {
                                     s2 = stripped;
                                 }
                                 log::info!("Got template instantiation: {}", s2);
-                                let typenames = parse_template_instantiation(s2)
-                                    .expect(&format!("Could not parse template definitions {s2}"));
+                                let typenames = parse_template_instantiation(s2)?
+                                    .ok_or(format!("Could not parse template definitions {s2}"))?;
                                 // check for template named `s` to declare
                                 let t = templates
                                     .iter()
-                                    .find(|x| &x.name == s.trim())
+                                    .find(|x| x.get_name() == s.trim())
                                     .expect(&format!("Could not find template {s} for definition"));
                                 t.define(typenames, self.bv)?;
                             }
@@ -2504,6 +2718,60 @@ mod tests {
     }
 
     #[test]
+    fn test_templated_typedef() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // First create the base template that will be aliased
+        let base_template = Template::new(
+            "Abc",
+            "T* a;\nUV** b;",
+            vec!["T".to_string(), "UV".to_string()],
+            Vec::new(),
+        );
+
+        // Test parsing of templated typedef
+        let typedef_assignment = "AA = Abc<N, uint32_t>";
+        let result = crate::parse_typedef_assignment(typedef_assignment);
+        assert!(result.is_ok() && result.as_ref().unwrap().is_some());
+
+        let (typedef_name, template_name, params) = result.unwrap().unwrap();
+        assert_eq!(typedef_name, "AA");
+        assert_eq!(template_name, "Abc");
+        assert_eq!(params, vec!["N".to_string(), "uint32_t".to_string()]);
+
+        // Instantiate typedef
+        assert!(base_template
+            .define(vec!["char".to_string(), "uint32_t".to_string()], &bv)
+            .is_ok());
+
+        // Create templated typedef
+        let templated_typedef = Template::new_typedef(
+            "AA".to_string(),
+            vec!["N".to_string()],
+            "Abc".to_string(),
+            vec![(0, "N".to_string())],        // N is at position 0
+            vec![(1, "uint32_t".to_string())], // uint32_t is at position 1
+            Vec::new(),
+        );
+
+        // Test instantiation
+        let templates = vec![base_template, templated_typedef];
+        let typedef_template = &templates[1];
+
+        // This should create AA<char> which internally creates Abc<char, uint32_t>
+        if let Err(e) = typedef_template.define(vec!["char".to_string()], bv.as_ref()) {
+            println!("Could not define AA<char>: {e}");
+            assert!(false);
+        }
+
+        // Check that both types were created
+        assert!(get_non_primitive_type_by_name("AA<char>", &bv).is_some());
+    }
+
+    #[test]
     fn test_parsing() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut save_path = path.clone();
@@ -2542,12 +2810,16 @@ mod tests {
     fn test_template_instantiation_parsing() {
         let s = "uint32_t";
         let typenames = parse_template_instantiation(s);
+        assert!(typenames.is_ok());
+        let typenames = typenames.unwrap();
         assert_eq!(
             typenames.as_ref().unwrap().get(0),
             Some(&"uint32_t".to_string())
         );
         let s = "uint32_t, void*";
         let typenames = parse_template_instantiation(s);
+        assert!(typenames.is_ok());
+        let typenames = typenames.unwrap();
         assert_eq!(
             typenames.as_ref().unwrap().get(0),
             Some(&"uint32_t".to_string())
@@ -2558,6 +2830,8 @@ mod tests {
         );
         let s = "uint32_t, structure_name<void*, struct2_name>";
         let typenames = parse_template_instantiation(s);
+        assert!(typenames.is_ok());
+        let typenames = typenames.unwrap();
         assert_eq!(
             typenames.as_ref().unwrap().get(0),
             Some(&"uint32_t".to_string())
@@ -2568,6 +2842,8 @@ mod tests {
         );
         let s = "structure_name<void*, struct2_name>, bool";
         let typenames = parse_template_instantiation(s);
+        assert!(typenames.is_ok());
+        let typenames = typenames.unwrap();
         assert_eq!(
             typenames.as_ref().unwrap().get(0),
             Some(&"structure_name<void*, struct2_name>".to_string())
@@ -2578,6 +2854,8 @@ mod tests {
         );
         let s = "structure_name<void*, struct2_name<uint32_t, bool, void**>>, class_name<void*, uint64_t>";
         let typenames = parse_template_instantiation(s);
+        assert!(typenames.is_ok());
+        let typenames = typenames.unwrap();
         assert_eq!(
             typenames.as_ref().unwrap().get(0),
             Some(&"structure_name<void*, struct2_name<uint32_t, bool, void**>>".to_string())

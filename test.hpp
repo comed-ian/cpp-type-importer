@@ -303,3 +303,9 @@ struct __attribute__((packed)) ZZZ {
     void* b;
     uint32_t c;
 };
+
+template <typename N> using AA = Abc<N, uint32_t>;
+
+Abc<char, uint32_t>;
+
+AA<char>;
