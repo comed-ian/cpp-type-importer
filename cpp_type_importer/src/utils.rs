@@ -66,6 +66,40 @@ pub fn get_non_primitive_type_by_name(name: &str, bv: &BinaryView) -> Option<Ref
     ))
 }
 
+pub fn parse_function_arguments(s: &str) -> Vec<String> {
+    let mut curr = String::new();
+    let mut args = Vec::<String>::new();
+    let mut stack = Vec::<char>::new();
+    for c in s.chars() {
+        match c {
+            ',' => {
+                if stack.is_empty() {
+                    args.push(curr);
+                    curr = String::new();
+                } else {
+                    curr.push(c);
+                }
+            }
+            '<' | '(' => {
+                stack.push(c);
+                curr.push(c);
+            }
+            '>' | ')' => {
+                stack.pop();
+                curr.push(c);
+            }
+            _ => curr.push(c),
+        }
+    }
+
+    // get last item if not empty
+    if !curr.is_empty() {
+        args.push(curr);
+    }
+
+    args
+}
+
 /// Parses a template member definition into individual tokens
 ///
 /// # Arguments
@@ -247,6 +281,8 @@ pub fn strip_type_prefix(s: &str) -> Option<&str> {
         s.strip_prefix("enum ")
     } else if s.starts_with("template ") {
         s.strip_prefix("template ")
+    } else if s.starts_with("typedef ") {
+        s.strip_prefix("typedef ")
     } else {
         Some(s)
     }

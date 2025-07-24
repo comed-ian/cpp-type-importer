@@ -135,7 +135,11 @@ impl<'a> Member {
         bv: &BinaryView,
         current_namespace: &Vec<String>,
     ) -> Result<Ref<Type>, String> {
-        log::debug!("Defining type: {}", t);
+        let mut ptr_level = String::new();
+        for _ in 0..depth {
+            ptr_level.push('*');
+        }
+        log::debug!("Defining type: {}{}", t, ptr_level);
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
@@ -270,16 +274,15 @@ impl<'a> Member {
                     name,
                     args
                 );
-                // TODO make these expects into errors
                 // TODO allow [] in arguments to function
                 let (return_type, _, depth, _) = parse_member_definition(return_type)
-                    .expect("Could not parse function member return type");
-                let args = parse_template_instantiation(args)?
-                    .ok_or("Could not parse function member args".to_string())?;
+                    .ok_or("Could not parse function member return type")?;
+                let args = parse_function_arguments(args);
+                log::info!("Parsed function args: {:?}", args);
                 let mut defined_args = vec![];
                 for a in args {
                     let (typ, name, depth, _) = parse_member_definition(&a)
-                        .expect("Could not parse argument to function definition");
+                        .ok_or("Could not parse argument to function definition")?;
                     defined_args.push((
                         name,
                         Self::define_type_with_namespace(&typ, depth, bv, current_namespace)?,
