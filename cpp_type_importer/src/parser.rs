@@ -1,8 +1,11 @@
 use crate::{
     find_closing_token, find_next_token, parse_template_definition, parse_template_instantiation,
-    parse_typedef_assignment, Class, Enum, Structure, Template, Typedef,
+    parse_typedef_assignment, strip_type_prefix, Class, Enum, Structure, Template, Typedef,
 };
-use binaryninja::binary_view::BinaryView;
+use binaryninja::{
+    binary_view::{BinaryView, BinaryViewExt},
+    types::{StructureBuilder, Type},
+};
 use regex::Regex;
 
 // Main parser for C++ header files
@@ -227,11 +230,18 @@ impl<'a> Parser<'a> {
                             t.define(self.bv)?;
                         } else {
                             // forward declaration
-                            let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
-                                .ok_or("Could not find closing token")?;
-                            s2 = s2.trim();
-                            log::info!("Got forward declaration {}", s2);
-                            idx += i2 + 1;
+                            let name = strip_type_prefix(s)
+                                .ok_or("Error stripping prefix for forward declaration")?
+                                .trim();
+                            let current_namespaces = self.get_current_namespace_path();
+                            let forward_decl = Type::structure(&StructureBuilder::new().finalize());
+                            let full_name = if current_namespaces.is_empty() {
+                                name.to_string()
+                            } else {
+                                format!("{}::{}", current_namespaces.join("::"), name)
+                            };
+                            log::info!("Forward declaring {full_name}");
+                            self.bv.define_user_type(&full_name, &forward_decl);
                         }
                     }
                     '{' => {
