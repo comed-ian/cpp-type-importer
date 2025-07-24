@@ -1,6 +1,8 @@
 use binaryninja::binary_view::{BinaryView, BinaryViewExt};
 use binaryninja::types::{EnumerationBuilder, Type};
 
+use crate::utils::parse_decimal_or_hex;
+
 /// Represents a C++ enum with values and size specification
 ///
 /// This structure stores enum name, underlying type size, and value mappings
@@ -27,7 +29,12 @@ impl<'a> Enum {
     ///
     /// # Returns
     /// A new `Enum` instance with parsed values
-    pub fn new(name: &str, size: u8, body: &str, namespace_path: Vec<String>) -> Self {
+    pub fn new(
+        name: &str,
+        size: u8,
+        body: &str,
+        namespace_path: Vec<String>,
+    ) -> Result<Self, String> {
         let mut values = Vec::new();
         // Enum values increment from the prior value if not specified,
         // with the default being 0
@@ -36,11 +43,14 @@ impl<'a> Enum {
         for line in body.lines() {
             // Each line has the form `VALUE,` or `VALUE=X,`
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || line.starts_with("//") {
                 continue;
             }
 
-            let line = line.trim_end_matches(',');
+            let line = line
+                .split_once(',')
+                .map_or(line, |(before, _)| before)
+                .trim();
 
             if let Some(eq_pos) = line.find('=') {
                 // Parse explicit assignment like "VALUE=1"
@@ -48,18 +58,19 @@ impl<'a> Enum {
                 let value_str = line[eq_pos + 1..].trim();
 
                 // Parse the numeric value
-                if let Ok(assigned_value) = value_str.parse::<u64>() {
-                    current_value = assigned_value;
-                } else {
-                    // Default to current_value
-                    log::warn!(
-                        "Could not parse enum value '{}', using {}",
-                        value_str,
-                        current_value
-                    );
+                match parse_decimal_or_hex(value_str)? {
+                    Some(val) => {
+                        let val = val as u64;
+                        current_value = val;
+                        values.push((name, current_value));
+                    }
+                    None => {
+                        return Err(format!(
+                            "Could not parse enum value '{}', using {}",
+                            value_str, current_value
+                        ))
+                    }
                 }
-
-                values.push((name, current_value));
             } else {
                 // No explicit assignment, use current_value
                 values.push((line.to_string(), current_value));
@@ -68,12 +79,12 @@ impl<'a> Enum {
             current_value += 1;
         }
 
-        Self {
+        Ok(Self {
             name: name.to_string(),
             size,
             values,
             namespace_path,
-        }
+        })
     }
 
     /// Defines the enum in Binary Ninja's type system

@@ -57,6 +57,9 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse(mut self, contents: &str) -> Result<(), String> {
+        // Remove /* */ comments
+        let re = Regex::new(r"(?s)/\*.*?\*/").unwrap();
+        let contents = re.replace_all(contents, "").to_string();
         let mut templates = Vec::<Template>::new();
         let mut idx = 0usize;
         loop {
@@ -280,7 +283,7 @@ impl<'a> Parser<'a> {
 
                             log::info!("Got enum {} with size {}", enum_name, size);
                             let enum_def =
-                                Enum::new(enum_name, size, s2, self.get_current_namespace_path());
+                                Enum::new(enum_name, size, s2, self.get_current_namespace_path())?;
                             enum_def.define(self.bv)?;
 
                             idx += i2 + 1;

@@ -49,7 +49,7 @@ impl<'a> Structure {
         for (i, member) in body.lines().enumerate() {
             if i == 0 {
                 // Check for __ptr_offset(X) directive from the first line of the structure's body
-                offset = parse_ptr_offset(member).unwrap_or(0);
+                offset = parse_ptr_offset(member)?.unwrap_or(0);
             }
 
             if member.trim().starts_with("//") {

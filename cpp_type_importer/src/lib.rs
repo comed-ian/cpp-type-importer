@@ -4,7 +4,6 @@ use binaryninja::logger::Logger;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 mod utils;
 use utils::*;
@@ -33,7 +32,8 @@ use parser::*;
 // TODO
 // 1. Conflicting vtable function names (e.g., MyMethod)
 // 2. Add comment lines to middle of structure and class
-// 3. Handle /* */
+// 3. allow typedef typ name[arrsize]
+
 /// Binary Ninja command for importing C++ types from test.hpp
 ///
 /// This command provides a user interface for triggering the C++ type import
@@ -1053,7 +1053,8 @@ int32_t c[0x8];"#,
         let bv = headless_session.load(&path).expect("Couldn't open bv");
 
         // Define enums in different namespaces
-        let global_enum = Enum::new("GlobalEnum", 4, "VALUE1,\nVALUE2,\nVALUE3", Vec::new());
+        let global_enum =
+            Enum::new("GlobalEnum", 4, "VALUE1,\nVALUE2,\nVALUE3", Vec::new()).unwrap();
         assert!(global_enum.define(bv.as_ref()).is_ok());
 
         let ns_enum = Enum::new(
@@ -1061,7 +1062,8 @@ int32_t c[0x8];"#,
             4,
             "NS_VALUE1,\nNS_VALUE2",
             vec!["MyNS".to_string()],
-        );
+        )
+        .unwrap();
         assert!(ns_enum.define(bv.as_ref()).is_ok());
 
         // Test get_full_name functionality for enums

@@ -273,6 +273,23 @@ pub fn parse_name(def: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+pub fn parse_decimal_or_hex(num: &str) -> Result<Option<i64>, String> {
+    // Parse decimal or hexadecimal
+    if num.starts_with("0x") || num.starts_with("0X") {
+        i64::from_str_radix(&num[2..], 16)
+            .map_err(|e| format!("Could not parse {num} into an i64: {e}"))
+            .map(|x| Some(x))
+    } else if num.starts_with("-0x") || num.starts_with("-0X") {
+        let res = i64::from_str_radix(&num[3..], 16)
+            .map_err(|e| format!("Could not parse {num} into an i64: {e:?}"))?;
+        Ok(Some(-res))
+    } else {
+        Ok(Some(num.parse::<i64>().map_err(|e| {
+            format!("Could not parse {num} into an i64: {e:?}")
+        })?))
+    }
+}
+
 /// Parses the __ptr_offset(X) directive from a structure definition
 ///
 /// # Arguments
@@ -280,22 +297,18 @@ pub fn parse_name(def: &str) -> Option<String> {
 ///
 /// # Returns
 /// The parsed offset value as u16, or None if not found
-pub fn parse_ptr_offset(def: &str) -> Option<i64> {
+pub fn parse_ptr_offset(def: &str) -> Result<Option<i64>, String> {
     use regex::Regex;
 
-    let re = Regex::new(r"__ptr_offset\((-?0x[0-9a-fA-F]+|-?\d+)\)").ok()?;
-    let captures = re.captures(def)?;
-    let offset_str = captures.get(1)?.as_str();
-
-    // Parse decimal or hexadecimal
-    if offset_str.starts_with("0x") || offset_str.starts_with("0X") {
-        i64::from_str_radix(&offset_str[2..], 16).ok()
-    } else if offset_str.starts_with("-0x") || offset_str.starts_with("-0X") {
-        let res = i64::from_str_radix(&offset_str[3..], 16).ok()?;
-        return Some(-res);
-    } else {
-        offset_str.parse::<i64>().ok()
+    let re = Regex::new(r"__ptr_offset\((-?0x[0-9a-fA-F]+|-?\d+)\)").unwrap();
+    if let Some(captures) = re.captures(def) {
+        let offset_str = captures
+            .get(1)
+            .ok_or("Could not get first capture group while parsing pointer offset")?
+            .as_str();
+        return parse_decimal_or_hex(offset_str);
     }
+    Ok(None)
 }
 
 /// Determines the pointer depth and extracts the suffix from a type definition
