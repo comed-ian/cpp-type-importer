@@ -119,8 +119,7 @@ impl<'a> Template {
                 body,
                 namespace_path,
             } => {
-                let templated_name =
-                    format!("{}<{}>", self.get_full_name(), template_params.join(", "));
+                let instantiated_name = format!("{name}<{}>", typenames.join(", "));
                 if typenames.len() != template_params.len() {
                     return Err(
                         "Provided typenames length does not match expected typenames length"
@@ -129,13 +128,17 @@ impl<'a> Template {
                 }
                 let mut members = Vec::<Member>::new();
                 for member in body.lines() {
-                    if member.trim() == "" {
+                    let member = member
+                        .split_once(';')
+                        .map_or(member, |(before, _)| before)
+                        .trim();
+                    if member == "" || member.starts_with("//") {
                         continue;
                     }
                     log::debug!(
                         "Defining member {} for templated type {}",
                         member,
-                        templated_name
+                        instantiated_name
                     );
                     // Create a new member and provide the typenames to swap in case
                     // the given member uses a typename
@@ -147,7 +150,6 @@ impl<'a> Template {
                         namespace_path,
                     )?);
                 }
-                let instantiated_name = format!("{name}<{}>", typenames.join(", "));
                 Structure::new_from_members(instantiated_name, members, 0, namespace_path.clone())
                     .define(bv)?;
                 Ok(())
