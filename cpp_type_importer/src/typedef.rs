@@ -1,4 +1,5 @@
 use binaryninja::binary_view::{BinaryView, BinaryViewExt};
+use binaryninja::types::Type;
 
 use crate::Member;
 use crate::{is_primitive, parse_member_definition};
@@ -13,18 +14,19 @@ pub struct Typedef {
     name: String,
     typ: String,
     depth: u8,
+    array_size: Option<u64>,
     namespace_path: Vec<String>,
 }
 
 impl<'a> Typedef {
     pub fn new(def: &str, namespace_path: Vec<String>) -> Self {
-        // TODO add [] to typedefs
-        let (typ, name, depth, _) =
+        let (typ, name, depth, array_size) =
             parse_member_definition(def).expect("Could not parse typedef definition");
         Self {
             name,
             typ,
             depth,
+            array_size,
             namespace_path,
         }
     }
@@ -39,11 +41,17 @@ impl<'a> Typedef {
     }
 
     pub fn define(&self, bv: &'a BinaryView) -> Result<(), String> {
-        let target_type = if let Some(tt) = is_primitive(&self.typ) {
+        let mut target_type = if let Some(tt) = is_primitive(&self.typ) {
             tt
         } else {
             Member::define_type(&self.typ, self.depth, bv)?
         };
+
+        // If this is an array typedef, wrap the type in an array
+        if let Some(array_size) = self.array_size {
+            target_type = Type::array(target_type.as_ref(), array_size);
+        }
+
         log::info!("Got typedef target type: {}", target_type);
 
         // Construct full name with namespace prefix

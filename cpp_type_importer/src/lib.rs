@@ -32,7 +32,6 @@ use parser::*;
 // TODO
 // 1. Conflicting vtable function names (e.g., MyMethod)
 // 2. Add comment lines to middle of structure and class
-// 3. allow typedef typ name[arrsize]
 
 /// Binary Ninja command for importing C++ types from test.hpp
 ///
@@ -169,7 +168,7 @@ mod tests {
     use crate::{
         get_non_primitive_type_by_name, get_type_by_name, get_type_width_by_name, is_primitive,
         parse_name, parse_template_definition, parse_template_instantiation, Class, Enum, Member,
-        Parser, Structure, Template,
+        Parser, Structure, Template, Typedef,
     };
     use binaryninja::binary_view::BinaryViewExt;
 
@@ -2492,5 +2491,28 @@ int64_t level4_data;"#,
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn test_array_typedef() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Test parsing array typedef like "typedef int array_name[16]"
+        let array_typedef = Typedef::new("int my_array[16]", vec![]);
+        assert!(array_typedef.define(bv.as_ref()).is_ok());
+
+        // Verify the typedef was created as an array type
+        let typedef_type = get_type_by_name("my_array", &bv).expect("Array typedef should exist");
+        assert_eq!(typedef_type.width(), 16 * 4); // 16 integers * 4 bytes each
+
+        // Test hex array size
+        let hex_typedef = Typedef::new("char hex_array[0x10]", vec![]);
+        assert!(hex_typedef.define(bv.as_ref()).is_ok());
+
+        let hex_type = get_type_by_name("hex_array", &bv).expect("Hex array typedef should exist");
+        assert_eq!(hex_type.width(), 0x10); // 16 chars * 1 byte each
     }
 }
