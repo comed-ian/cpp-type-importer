@@ -32,6 +32,8 @@ use parser::*;
 // TODO
 // 1. Conflicting vtable function names (e.g., MyMethod)
 // 2. Add comment lines to middle of structure and class
+// 3. Add test for parsing template in function arguments
+// 4. Bonus for within a templated type
 
 /// Binary Ninja command for importing C++ types from test.hpp
 ///
@@ -141,7 +143,7 @@ impl Command for ImportCppTypesCommand {
 pub extern "C" fn CorePluginInit() -> bool {
     // Initialize logging
     Logger::new("C++ Type Importer")
-        .with_level(log::LevelFilter::Info)
+        .with_level(log::LevelFilter::Debug)
         .init();
 
     // Register the C++ Type Importer command
