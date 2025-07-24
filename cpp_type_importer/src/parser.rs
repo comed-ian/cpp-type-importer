@@ -87,6 +87,17 @@ impl<'a> Parser<'a> {
                     log::info!("Skipping line: {} {}", s, s2);
                     idx += i2 + 1;
                     continue;
+                } else if s.starts_with("#pragma") {
+                    let (i2, _, mut s2) = find_closing_token(&contents[idx..], c)
+                        .ok_or("Could not find closing token".to_string())?;
+                    s2 = s2.trim();
+                    // throw out pragma statements
+                    if c != '"' {
+                        return Err("Could not find \"..\" in pragma statement".to_string());
+                    }
+                    log::info!("Skipping line: {} {}", s, s2);
+                    idx += i2 + 1;
+                    continue;
                 }
                 match c {
                     '/' => {
