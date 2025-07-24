@@ -1,4 +1,5 @@
 use binaryninja::binary_view::{BinaryView, BinaryViewExt};
+use binaryninja::types::{StructureBuilder, Type};
 
 use crate::{get_non_primitive_type_by_name, parse_name, Member, Structure};
 
@@ -104,6 +105,13 @@ impl<'a> Template {
     /// * `templates` - Reference to all templates for typedef resolution
     /// * `typedef_name` - Optional name for typedef templates (e.g., "AA" instead of "Abc")
     pub fn define<'b>(&self, typenames: Vec<String>, bv: &'a BinaryView) -> Result<(), String> {
+        // Forward declare the type, which will be clobbered anyway.
+        // Necessary for templated lists, arrays, trees, etc.
+        let forward_decl = Type::structure(&StructureBuilder::new().finalize());
+        let full_name = self.get_full_name();
+        let full_name = format!("{full_name}<{}>", typenames.join(", "));
+        log::info!("Forward declaring templated structure: {full_name}");
+        bv.define_user_type(&full_name, &forward_decl);
         match self {
             Template::StructTemplate {
                 name,
@@ -111,6 +119,8 @@ impl<'a> Template {
                 body,
                 namespace_path,
             } => {
+                let templated_name =
+                    format!("{}<{}>", self.get_full_name(), template_params.join(", "));
                 if typenames.len() != template_params.len() {
                     return Err(
                         "Provided typenames length does not match expected typenames length"
@@ -122,7 +132,11 @@ impl<'a> Template {
                     if member.trim() == "" {
                         continue;
                     }
-                    log::debug!("Defining member: {}", member);
+                    log::debug!(
+                        "Defining member {} for templated type {}",
+                        member,
+                        templated_name
+                    );
                     // Create a new member and provide the typenames to swap in case
                     // the given member uses a typename
                     members.push(Member::new(

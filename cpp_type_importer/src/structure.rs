@@ -32,6 +32,13 @@ impl<'a> Structure {
     ///
     /// # Returns
     /// A new `Structure` instance
+    ///
+    /// # Notes
+    /// Note that this method clobbers any existing struct with the same
+    /// name, as it forward-declares itself so that self-referrential members
+    /// (e.g., linked list pointers) have a type to reference. Calling this
+    /// method assumes that returned `Structure` will be subsequently defined
+    /// with a call to [`Structure::define`].
     pub fn new<'b>(
         def: &str,
         body: &str,
@@ -39,6 +46,16 @@ impl<'a> Structure {
         namespace_path: Vec<String>,
     ) -> Result<Self, String> {
         let name = parse_name(def).expect(&format!("Could not parse definition {def} for name"));
+        // Forward declare the type, which will be clobbered anyway.
+        // Necessary for templated lists, arrays, trees, etc.
+        let forward_decl = Type::structure(&StructureBuilder::new().finalize());
+        let full_name = if namespace_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", namespace_path.join("::"), name)
+        };
+        log::info!("Forward declaring structure: {full_name}");
+        bv.define_user_type(&full_name, &forward_decl);
 
         // Check for packed attribute in the definition
         let packed = def.contains("__attribute__((packed))");
@@ -102,6 +119,12 @@ impl<'a> Structure {
     /// # Returns
     /// `true` if the structure was successfully defined
     pub fn define<'b>(&mut self, bv: &'a BinaryView) -> Result<(), String> {
+        let full_name = self.get_full_name();
+        log::debug!(
+            "Defining {} structure {}",
+            if self.packed { "(packed)" } else { "" },
+            full_name
+        );
         let mut builder = StructureBuilder::new();
 
         // Set packed flag if the structure is packed
@@ -118,12 +141,6 @@ impl<'a> Structure {
             m.define(None, &mut builder, bv)?;
         }
         let s = Type::structure(&builder.finalize());
-        let full_name = self.get_full_name();
-        log::debug!(
-            "Defining {} structure {}",
-            if self.packed { "(packed)" } else { "" },
-            full_name
-        );
         bv.define_user_type(&full_name, &s);
         Ok(())
     }
