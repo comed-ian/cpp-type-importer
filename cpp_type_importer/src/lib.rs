@@ -1,10 +1,10 @@
 use binaryninja::binary_view::BinaryView;
 use binaryninja::command::{register_command, Command};
 use binaryninja::logger::Logger;
-use log::{error, info, LevelFilter};
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 mod utils;
 use utils::*;
@@ -46,32 +46,73 @@ impl Command for ImportCppTypesCommand {
     /// # Arguments
     /// * `view` - Binary Ninja binary view reference
     fn action(&self, view: &BinaryView) {
-        info!("Importing C++ types from test.hpp");
+        log::info!("Importing C++ types from test.hpp");
 
-        // Get the path to test.hpp (same as in the test)
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("../test.hpp");
+        let path = if let Some(p) = binaryninja::interaction::get_text_line_input(
+            "Enter path to directory holding .hpp files",
+            "Directory input",
+        ) {
+            if !Path::new(&p).exists() {
+                log::error!("Path {p} does not exist");
+                return;
+            }
+            p
+        } else {
+            log::error!("Could not get directory input from user");
+            return;
+        };
+        let filenames = if let Some(p) = binaryninja::interaction::get_text_line_input(
+            "Enter a comma-separated list of .hpp files",
+            "Filename(s) input",
+        ) {
+            let mut filenames = vec![];
+            for f in p.split(",") {
+                let mut buf = match PathBuf::from_str(&path) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        log::error!("Could not create PathBuf for {path}: {e}");
+                        return;
+                    }
+                };
+                buf.push(f);
+                if !buf.exists() {
+                    log::error!("Path {p} does not exist");
+                    return;
+                }
+                filenames.push(buf);
+            }
+            filenames
+        } else {
+            log::error!("Could not get directory input from user");
+            return;
+        };
 
         // Read the file contents
-        match File::open(&path) {
-            Ok(mut file) => {
-                let mut contents = String::new();
-                match file.read_to_string(&mut contents) {
-                    Ok(_) => {
-                        info!("Successfully read test.hpp, parsing C++ types...");
-                        let parser = Parser::new(view);
-                        match parser.parse(&contents) {
-                            Err(e) => log::error!("Could not parse types file: {e}"),
-                            Ok(_) => log::info!("C++ type import completed"),
+        for f in filenames {
+            log::info!("Opening file {}", f.display());
+            match File::open(&f) {
+                Ok(mut file) => {
+                    let mut contents = String::new();
+                    match file.read_to_string(&mut contents) {
+                        Ok(_) => {
+                            log::info!("Successfully read {}, parsing C++ types...", f.display());
+                            let parser = Parser::new(view);
+                            match parser.parse(&contents) {
+                                Err(e) => log::error!(
+                                    "Could not parse types from file {}: {e}",
+                                    f.display()
+                                ),
+                                Ok(_) => log::info!("C++ type import completed"),
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to read {}: {}", f.display(), e);
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to read test.hpp: {}", e);
-                    }
                 }
-            }
-            Err(e) => {
-                error!("Failed to open test.hpp: {}", e);
+                Err(e) => {
+                    log::error!("Failed to open {}: {}", f.display(), e);
+                }
             }
         }
     }
@@ -101,7 +142,7 @@ impl Command for ImportCppTypesCommand {
 pub extern "C" fn CorePluginInit() -> bool {
     // Initialize logging
     Logger::new("C++ Type Importer")
-        .with_level(LevelFilter::Info)
+        .with_level(log::LevelFilter::Info)
         .init();
 
     // Register the C++ Type Importer command
@@ -111,7 +152,7 @@ pub extern "C" fn CorePluginInit() -> bool {
         ImportCppTypesCommand {},
     );
 
-    info!("C++ Type Importer plugin initialized");
+    log::info!("C++ Type Importer plugin initialized");
 
     true
 }
