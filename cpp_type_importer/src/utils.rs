@@ -237,6 +237,21 @@ pub fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<S
     }
 }
 
+pub fn strip_type_prefix(s: &str) -> Option<&str> {
+    // Strip type keywords
+    if s.starts_with("struct ") {
+        s.strip_prefix("struct ")
+    } else if s.starts_with("class ") {
+        s.strip_prefix("class ")
+    } else if s.starts_with("enum ") {
+        s.strip_prefix("enum ")
+    } else if s.starts_with("template ") {
+        s.strip_prefix("template ")
+    } else {
+        Some(s)
+    }
+}
+
 /// Parses the name from a class, struct, template, or enum definition
 ///
 /// Extracts the type name from definitions like "struct MyStruct" or "class MyClass"
@@ -250,16 +265,7 @@ pub fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<S
 pub fn parse_name(def: &str) -> Option<String> {
     let mut s = def.trim();
 
-    // Strip type keywords
-    if s.starts_with("struct ") {
-        s = s.strip_prefix("struct ")?;
-    } else if s.starts_with("class ") {
-        s = s.strip_prefix("class ")?;
-    } else if s.starts_with("enum ") {
-        s = s.strip_prefix("enum ")?;
-    } else if s.starts_with("template ") {
-        s.strip_prefix("template ")?;
-    }
+    s = strip_type_prefix(s)?;
 
     // Handle attributes that come after the type keyword but before the name
     // e.g., "struct __attribute__((packed)) MyStruct"
@@ -372,9 +378,9 @@ pub fn parse_array_size(def: &str) -> Option<(String, u64)> {
 pub fn parse_member_definition(def: &str) -> Option<(String, String, u8, Option<u64>)> {
     let mut def = def.trim();
     if let Some(trimmed) = def.strip_suffix(";") {
-        def = trimmed;
+        def = trimmed.trim();
     }
-    let mut def = def.trim();
+    def = strip_type_prefix(def)?;
 
     // Check for array syntax first
     if let Some((element_part, array_size)) = parse_array_size(def) {
