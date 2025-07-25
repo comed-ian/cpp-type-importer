@@ -219,7 +219,9 @@ impl<'a> Parser<'a> {
                                 let t = self
                                     .templates
                                     .iter()
-                                    .find(|x| x.get_name() == s.trim())
+                                    .find(|x| {
+                                        x.get_name() == s.trim() || x.get_full_name() == s.trim()
+                                    })
                                     .ok_or(&format!(
                                         "Could not find template {s} for definition"
                                     ))?;
