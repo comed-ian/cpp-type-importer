@@ -83,6 +83,11 @@ impl<'a> Class {
         } else {
             format!("{}::{}", namespace_path.join("::"), name)
         };
+        log::info!(
+            "Forward declaring class {} with current namespace(s): {:?}",
+            name,
+            namespace_path
+        );
         bv.define_user_type(&full_name, &forward_decl);
 
         let mut vtable_methods = Vec::new();
@@ -106,7 +111,8 @@ impl<'a> Class {
 
             if in_vtable {
                 // Parse vtable method
-                let (method, override_info) = Self::parse_vtable_method(line, bv, &name)?;
+                let (method, override_info) =
+                    Self::parse_vtable_method(line, bv, &name, &namespace_path)?;
                 vtable_methods.push((method, override_info));
             } else {
                 // Parse member variable
@@ -154,6 +160,7 @@ impl<'a> Class {
         line: &str,
         bv: &'a BinaryView,
         class_name: &str,
+        namespace_path: &Vec<String>,
     ) -> Result<(Member, Option<String>), String> {
         // Parse offset comment (`// ; offset=XX`) for `*this` with regex
         let offset_regex = Regex::new(r"//\s*;\s*offset=(-?\d+)").unwrap();
@@ -181,7 +188,8 @@ impl<'a> Class {
         let clean_line = override_regex.replace(&clean_line, "").trim().to_string();
 
         // Parse method signature and inject this pointer
-        let member = Self::parse_method_signature(&clean_line, bv, this_offset, class_name)?;
+        let member =
+            Self::parse_method_signature(&clean_line, bv, this_offset, class_name, namespace_path)?;
         Ok((member, override_info))
     }
 
@@ -201,6 +209,7 @@ impl<'a> Class {
         bv: &'a BinaryView,
         this_offset: Option<usize>,
         class_name: &str,
+        namespace_path: &Vec<String>,
     ) -> Result<Member, String> {
         let line = line.trim();
 
@@ -215,7 +224,13 @@ impl<'a> Class {
             } else {
                 format!("void (*~{class_name})();")
             };
-            return Ok(Member::new(&method_signature, bv, None, None, &Vec::new())?);
+            return Ok(Member::new(
+                &method_signature,
+                bv,
+                None,
+                None,
+                &namespace_path,
+            )?);
         }
 
         // Check for constructor: ClassName(...)
@@ -253,7 +268,7 @@ impl<'a> Class {
                     format!("void (*{class_name})({});", all_params.join(", "))
                 };
 
-                return Member::new(&method_signature, bv, None, None, &Vec::new()).into();
+                return Member::new(&method_signature, bv, None, None, namespace_path).into();
             }
         }
 
@@ -300,7 +315,7 @@ impl<'a> Class {
                 format!("{return_type} (*{method_name})({});", all_params.join(", "))
             };
 
-            Member::new(&method_signature, bv, None, None, &Vec::new()).into()
+            Member::new(&method_signature, bv, None, None, &namespace_path).into()
         } else {
             Err(format!("Could not parse method signature {line}"))
         }
