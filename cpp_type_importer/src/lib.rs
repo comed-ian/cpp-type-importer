@@ -4,6 +4,7 @@ use binaryninja::logger::Logger;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 mod utils;
 use utils::*;
@@ -89,6 +90,7 @@ impl Command for ImportCppTypesCommand {
         };
 
         // Read the file contents
+        let mut parser = Parser::new(view.as_ref());
         for f in filenames {
             log::info!("Opening file {}", f.display());
             match File::open(&f) {
@@ -97,13 +99,14 @@ impl Command for ImportCppTypesCommand {
                     match file.read_to_string(&mut contents) {
                         Ok(_) => {
                             log::info!("Successfully read {}, parsing C++ types...", f.display());
-                            let parser = Parser::new(view);
                             match parser.parse(&contents) {
                                 Err(e) => log::error!(
                                     "Could not parse types from file {}: {e}",
                                     f.display()
                                 ),
-                                Ok(_) => log::info!("C++ type import completed"),
+                                Ok(_) => {
+                                    log::info!("C++ type import completed for file {}", f.display())
+                                }
                             }
                         }
                         Err(e) => {
@@ -286,22 +289,24 @@ mod tests {
     fn test_parsing() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut save_path = path.clone();
-        path.push("../test.hpp");
         save_path.push("test.bndb");
+        let paths = vec!["../test.hpp"];
         // get temp bv for arch
         let headless_session = Session::new().expect("Failed to initialize session");
         let bv = headless_session.load(&save_path).expect("Couldn't open bv");
-        let mut file = File::open(&path).expect("Could not open test file");
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .expect("Could not read file contents");
-        let p = Parser {
-            bv: bv.as_ref(),
-            namespace_stack: vec![],
-        };
-        if let Err(e) = p.parse(&contents) {
-            println!("Could not parse input file {e}");
-            assert!(false);
+        let mut parser = Parser::new(bv.as_ref());
+        for p in paths {
+            let mut full_path = path.clone();
+            full_path.push(p);
+            let mut file = File::open(&full_path)
+                .expect(&format!("Could not open test file {}", full_path.display()));
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .expect("Could not read file contents");
+            if let Err(e) = parser.parse(&contents) {
+                println!("Could not parse input file {e}");
+                assert!(false);
+            }
         }
     }
 
@@ -1187,7 +1192,7 @@ int32_t c[0x8];"#,
             }
         "#;
 
-        let parser = Parser::new(bv.as_ref());
+        let mut parser = Parser::new(bv.as_ref());
         if let Err(e) = parser.parse(namespace_code) {
             println!("Could not parse input code {e}");
             assert!(false);

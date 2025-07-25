@@ -17,6 +17,9 @@ pub struct Parser<'a> {
     pub bv: &'a BinaryView,
     /// Current namespace stack for tracking nested namespaces
     pub namespace_stack: Vec<String>,
+    /// List of current templates, potentially defined in previously
+    /// parsed header files
+    pub templates: Vec<Template>,
 }
 
 impl<'a> Parser<'a> {
@@ -31,6 +34,7 @@ impl<'a> Parser<'a> {
         Self {
             bv,
             namespace_stack: Vec::new(),
+            templates: vec![],
         }
     }
 
@@ -59,11 +63,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse(mut self, contents: &str) -> Result<(), String> {
+    pub fn parse(&mut self, contents: &str) -> Result<(), String> {
         // Remove /* */ comments
         let re = Regex::new(r"(?s)/\*.*?\*/").unwrap();
         let contents = re.replace_all(contents, "").to_string();
-        let mut templates = Vec::<Template>::new();
         let mut idx = 0usize;
         loop {
             // find next ;, {, <, "
@@ -121,11 +124,11 @@ impl<'a> Parser<'a> {
                             // template definition, store for later declarations
                             log::info!("Got template type: {}", s2);
                             let typenames = parse_template_definition(s2)
-                                .expect(&format!("Could not parse template definitions {s2}"));
+                                .ok_or(&format!("Could not parse template definitions {s2}"))?;
                             let (i3, c3, s3) = find_next_token(&contents[idx + i2 + 1..])
                                 .ok_or("Could not find closing token for template definition")?;
 
-                            if s3.trim().starts_with("using") {
+                            if s3.trim().starts_with("using ") {
                                 // Templated typedef: template <...> using AA = Abc<T, uint32_t>;
                                 // Find the closing ';' specifically
                                 let (i4, _, s4) =
@@ -163,7 +166,7 @@ impl<'a> Parser<'a> {
                                     concrete_parameters,
                                     self.get_current_namespace_path(),
                                 );
-                                templates.push(t);
+                                self.templates.push(t);
 
                                 idx += i3 + i4 + 2;
                             } else if c3 == '{' {
@@ -180,7 +183,7 @@ impl<'a> Parser<'a> {
                                     typenames,
                                     self.get_current_namespace_path(),
                                 );
-                                templates.push(t);
+                                self.templates.push(t);
                             } else {
                                 // Unknown template pattern, skip it
                                 return Err(format!(
@@ -193,7 +196,7 @@ impl<'a> Parser<'a> {
                             // s looks like `struct_name<` or `typedef struct_name<`.
                             // Find closing `;` to get the contents within the angled brackets.
                             let (i2, _, mut s2) = find_closing_token(&contents[idx..], ';')
-                                .expect("Could not find closing token for template instantiation");
+                                .ok_or("Could not find closing token for template instantiation")?;
                             if s.starts_with("typedef ") {
                                 let mut typedef_string = s[8..].to_string();
                                 typedef_string.push('<');
@@ -213,10 +216,13 @@ impl<'a> Parser<'a> {
                                 let typenames = parse_template_instantiation(s2)?
                                     .ok_or(format!("Could not parse template definitions {s2}"))?;
                                 // check for template named `s` to declare
-                                let t = templates
+                                let t = self
+                                    .templates
                                     .iter()
                                     .find(|x| x.get_name() == s.trim())
-                                    .expect(&format!("Could not find template {s} for definition"));
+                                    .ok_or(&format!(
+                                        "Could not find template {s} for definition"
+                                    ))?;
                                 t.define(typenames, self.bv)?;
                             }
                             idx += i2 + 1;
@@ -246,9 +252,9 @@ impl<'a> Parser<'a> {
                     }
                     '{' => {
                         // namespace, class, or struct definition
-                        if s.starts_with("namespace") {
+                        if s.starts_with("namespace ") {
                             // Extract namespace name
-                            let namespace_name = s.strip_prefix("namespace").unwrap().trim();
+                            let namespace_name = s.strip_prefix("namespace ").unwrap().trim();
                             if !namespace_name.is_empty() {
                                 self.enter_namespace(namespace_name);
                                 // Continue parsing inside the namespace

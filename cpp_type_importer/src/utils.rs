@@ -421,20 +421,20 @@ pub fn parse_member_definition(def: &str) -> Option<(String, String, u8, Option<
     // Check for array syntax first
     if let Some((element_part, array_size)) = parse_array_size(def) {
         let name = parse_member_name(&element_part).unwrap_or("".to_string());
-        let mut type_part = element_part.strip_suffix(&name).unwrap();
+        let mut type_part = element_part.strip_suffix(&name)?;
         let (depth, suffix) = get_pointer_depth(type_part);
         if !suffix.is_empty() {
-            type_part = type_part.strip_suffix(&suffix).unwrap();
+            type_part = type_part.strip_suffix(&suffix)?;
         }
         return Some((type_part.to_string(), name, depth, Some(array_size)));
     }
 
     // Handle non-array types
     let name = parse_member_name(def).unwrap_or("".to_string());
-    def = def.strip_suffix(&name).unwrap();
+    def = def.strip_suffix(&name)?;
     let (depth, suffix) = get_pointer_depth(def);
     if !suffix.is_empty() {
-        def = def.strip_suffix(&suffix).unwrap();
+        def = def.strip_suffix(&suffix)?;
     }
 
     Some((def.to_string(), name, depth, None))
