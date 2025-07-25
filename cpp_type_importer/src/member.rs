@@ -139,7 +139,12 @@ impl<'a> Member {
         for _ in 0..depth {
             ptr_level.push('*');
         }
-        log::debug!("Defining type: {}{}", t, ptr_level);
+        log::debug!(
+            "Defining type: {}{} with current namespaces {:?}",
+            t,
+            ptr_level,
+            current_namespace
+        );
         let mut typ = if let Some(tt) = is_primitive(t) {
             tt
         } else {
@@ -208,6 +213,13 @@ impl<'a> Member {
         template_defs: Option<&Vec<String>>,
         current_namespace: &Vec<String>,
     ) -> Result<Self, String> {
+        // Remove any trailing comments from the current line. If comments are
+        // meaningful (e.g., the `offset=` in a Class definition), these
+        // should be parsed ahead of time.
+        let def = def.split_once(';').map_or(def, |(before, _)| before).trim();
+        if def == "" || def.starts_with("//") {
+            return Err(format!("Member definition {def} is invalid"));
+        };
         let (typ, name, depth, arrsize) =
             parse_member_definition(def).expect("Could not parse member definition");
         log::info!(

@@ -128,11 +128,7 @@ impl<'a> Template {
                 }
                 let mut members = Vec::<Member>::new();
                 for member in body.lines() {
-                    let member = member
-                        .split_once(';')
-                        .map_or(member, |(before, _)| before)
-                        .trim();
-                    if member == "" || member.starts_with("//") {
+                    if member.trim() == "" || member.trim().starts_with("//") {
                         continue;
                     }
                     log::debug!(
