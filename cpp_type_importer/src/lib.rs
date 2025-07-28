@@ -6,28 +6,28 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-mod utils;
+pub mod utils;
 use utils::*;
 
-mod class;
+pub mod class;
 use class::*;
 
-mod member;
+pub mod member;
 use member::*;
 
-mod enumeration;
+pub mod enumeration;
 use enumeration::*;
 
-mod typedef;
+pub mod typedef;
 use typedef::*;
 
-mod template;
+pub mod template;
 use template::*;
 
-mod structure;
+pub mod structure;
 use structure::*;
 
-mod parser;
+pub mod parser;
 use parser::*;
 
 // TODO
