@@ -155,12 +155,12 @@ pub fn parse_template_instantiation(s: &str) -> Result<Option<Vec<String>>, Stri
             }
             '>' => {
                 stack.pop();
-                if stack.is_empty() {
-                    curr.push(c);
-                    typenames.push(curr);
-                    curr = String::new();
-                    continue;
-                }
+                // if stack.is_empty() {
+                //     curr.push(c);
+                //     typenames.push(curr);
+                //     curr = String::new();
+                //     continue;
+                // }
             }
             ',' => {
                 if curr.is_empty() {
