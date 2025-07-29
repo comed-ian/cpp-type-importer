@@ -643,7 +643,7 @@ impl<'a> Class {
 
         if self.base_classes.is_empty() {
             // No inheritance - create regular vtable
-            let vtable_name = format!("{}_vtable", self.name);
+            let vtable_name = format!("{}_vtable", self.get_full_name());
             let mut vtable_builder = StructureBuilder::new();
 
             for (method, _) in &self.vtable_methods {
@@ -684,12 +684,12 @@ impl<'a> Class {
                     .find(|(_, off)| *off == current_offset)
                 {
                     None => vtable_names_and_offsets.push((
-                        format!("{}_vtable_{top_level_base}", self.name),
+                        format!("{}_vtable_{top_level_base}", self.get_full_name()),
                         format!("{top_level_base}_vtable"),
                         current_offset,
                     )),
                     Some(parent_name) => vtable_names_and_offsets.push((
-                        format!("{}_vtable_{}", self.name, top_level_base),
+                        format!("{}_vtable_{}", self.get_full_name(), top_level_base),
                         format!("{top_level_base}_vtable_{}", parent_name.0),
                         current_offset,
                     )),
@@ -700,7 +700,7 @@ impl<'a> Class {
                     .filter(|(_, off)| *off > current_offset && *off < current_offset + width)
                 {
                     vtable_names_and_offsets.push((
-                        format!("{}_vtable_{base}", self.name),
+                        format!("{}_vtable_{base}", self.get_full_name()),
                         format!("{top_level_base}_vtable_{base}"),
                         *off,
                     ));
