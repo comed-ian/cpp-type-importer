@@ -344,13 +344,11 @@ impl<'a> Class {
                     log::info!("Checking override: {}", override_str);
                     if override_str.contains(base_class_vtable_name) {
                         // Parse the override information to find the target method
-                        if let Some(offset) =
-                            Self::parse_override_offset(&override_str, base_class_vtable_name, bv)
-                        {
-                            // Override at specific offset
-                            method.define(Some(offset), vtable_builder, bv)?;
-                            continue;
-                        }
+                        let offset =
+                            Self::parse_override_offset(&override_str, base_class_vtable_name, bv)?;
+                        // Override at specific offset
+                        method.define(Some(offset), vtable_builder, bv)?;
+                        continue;
                     }
                     remaining.push((method.clone(), Some(override_str.clone())));
                 } else if process_non_overriding {
@@ -399,7 +397,7 @@ impl<'a> Class {
         override_str: &str,
         base_vtable_name: &str,
         bv: &'a BinaryView,
-    ) -> Option<u64> {
+    ) -> Result<u64, String> {
         // Parse override string like `void (* <base_vtable_name>::fn)(struct base* this);`
         // Find the vtable type and look for the method
         if let Some(base_vtable_type_id) = bv.type_id_by_name(base_vtable_name) {
@@ -429,14 +427,32 @@ impl<'a> Class {
                                     base_vtable_name,
                                     member.offset
                                 );
-                                return Some(member.offset);
+                                return Ok(member.offset);
                             }
                         }
+                        return Err(format!(
+                            "Could not find override for {override_str} in {base_vtable_name}"
+                        ));
+                    } else {
+                        return Err(format!(
+                            "Could not find cleaned override for {override_str}"
+                        ));
                     }
+                } else {
+                    Err(format!(
+                        "Could not find {base_vtable_name} structure for override"
+                    ))
                 }
+            } else {
+                return Err(format!(
+                    "Could not find {base_vtable_name} type for override"
+                ));
             }
+        } else {
+            return Err(format!(
+                "Could not find {base_vtable_name} type id for override"
+            ));
         }
-        None
     }
 
     /// Extracts the method name from an override specification
@@ -452,7 +468,7 @@ impl<'a> Class {
     fn extract_method_name_from_override(override_str: &str) -> Option<String> {
         // Parse override string like `void (* base_vtable::fn)(struct base* this);`
         // Remove the inherited `base_vtable::` prefix while keeping the rest
-        let regex = Regex::new(r"\w+_vtable(\w+)?::").unwrap();
+        let regex = Regex::new(r"\S+_vtable(\w+)?::").unwrap();
         let cleaned = regex.replace_all(override_str, "");
         Some(cleaned.to_string())
     }
