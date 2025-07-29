@@ -483,10 +483,12 @@ impl<'a> Class {
     /// # Returns
     /// `Some(String)` with the cleaned member name (e.g., `type_name member_name`)
     fn extract_member_from_override(override_str: &str, base_class: &str) -> Option<String> {
-        // For member overrides, remove the `base_class::` prefix from anywhere in the string
+        // For member overrides, remove the `base_class::` prefix from the member name, which
+        // is the last space-separated substring in the string
+        let (typ, name) = override_str.rsplit_once(" ")?;
         let prefix = format!("{}::", base_class);
-        let cleaned = override_str.replace(&prefix, "");
-        Some(cleaned)
+        let cleaned = name.replace(&prefix, "");
+        Some(format!("{typ} {cleaned}"))
     }
 
     /// Parses the offset for a member override in base classes
@@ -502,7 +504,7 @@ impl<'a> Class {
         override_str: &str,
         base_classes: &[(String, u64)],
         bv: &'a BinaryView,
-    ) -> Option<(String, u64)> {
+    ) -> Result<(String, u64), String> {
         // Try to find the member in each base class
         for (base_class, base_offset) in base_classes {
             if let Some(cleaned_override) =
@@ -537,15 +539,27 @@ impl<'a> Class {
                                         base_class,
                                         member.offset
                                     );
-                                    return Some((base_class.clone(), member.offset + base_offset));
+                                    return Ok((base_class.clone(), member.offset + base_offset));
                                 }
                             }
+                        } else {
+                            return Err(format!(
+                                "Could not find {base_class} structure for override"
+                            ));
                         }
+                    } else {
+                        return Err(format!("Could not find {base_class} type for override"));
                     }
+                } else {
+                    return Err(format!("Could not find {base_class} type id for override"));
                 }
+            } else {
+                return Err(format!("Could not get cleaned override for {override_str}"));
             }
         }
-        None
+        Err(format!(
+            "Could not find override {override_str} in base classes"
+        ))
     }
 
     /// Recursively collects all base classes for this class, including indirect inheritance
@@ -561,7 +575,7 @@ impl<'a> Class {
 
         // Depth-first search to collect all base classes with their offsets
         fn collect_recursive(
-            override_vtable: bool,
+            _override_vtable: bool,
             base_class: &str,
             current_offset: u64,
             all_bases: &mut Vec<(String, u64)>,
@@ -850,23 +864,13 @@ impl<'a> Class {
             if let Some(override_str) = override_info {
                 // This member overrides a base class member
                 // Look for the base class in all collected base classes (including indirect ones)
-                if let Some((_, base_offset)) =
-                    Self::parse_member_override_offset(override_str, &all_base_classes, bv)
-                {
-                    // Find the offset of this base class in the collected base classes
-                    // let mut actual_offset = base_offset;
-                    // for (collected_base, collected_offset) in &all_base_classes {
-                    //     if collected_base == &base_class {
-                    //         actual_offset += collected_offset;
-                    //         break;
-                    //     }
-                    // }
-                    log::debug!("Found override for {override_str} at offset {base_offset:x}");
+                let (_, base_offset) =
+                    Self::parse_member_override_offset(override_str, &all_base_classes, bv)?;
+                log::debug!("Found override for {override_str} at offset {base_offset:x}");
 
-                    // Insert the overriding member at the calculated offset
-                    member.define(Some(base_offset), &mut class_builder, bv)?;
-                    continue;
-                }
+                // Insert the overriding member at the calculated offset
+                member.define(Some(base_offset), &mut class_builder, bv)?;
+                continue;
             }
 
             // No override, append normally
