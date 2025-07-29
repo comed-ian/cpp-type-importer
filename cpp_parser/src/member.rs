@@ -274,7 +274,8 @@ impl<'a> Member {
                 log::info!("Instantiated templated type: {}", def);
             }
             // Try to match function definition: `return_type (*name)(args)`
-            let func_regex = Regex::new(r"(.*) \(\*(.*)\)\((.*)\)").unwrap();
+            // Supports arguments that are function pointers.
+            let func_regex = Regex::new(r"^(.*?) \(\*(.*?)\)\((.*)\)$").unwrap();
             if let Some(captures) = func_regex.captures(&def) {
                 let return_type = captures.get(1).unwrap().as_str().trim();
                 let name = captures.get(2).unwrap().as_str().trim();
@@ -293,12 +294,27 @@ impl<'a> Member {
                 log::info!("Parsed function args: {:?}", args);
                 let mut defined_args = vec![];
                 for a in args {
-                    let (typ, name, depth, _) = parse_member_definition(&a)
-                        .ok_or("Could not parse argument to function definition")?;
-                    defined_args.push((
-                        name,
-                        Self::define_type_with_namespace(&typ, depth, bv, current_namespace)?,
-                    ));
+                    // Allow function pointers within arguments
+                    if let Some(_) = func_regex.captures(&a) {
+                        if let Member::Function { name, args, ret } =
+                            Member::new(&a, bv, template_members, template_defs, current_namespace)?
+                        {
+                            let func_type = Self::new_function_type(&ret, &args, bv)?;
+                            defined_args.push((name, func_type));
+                        } else {
+                            return Err(
+                                "Incorrect member type returned when parsing a function argument"
+                                    .to_string(),
+                            );
+                        }
+                    } else {
+                        let (typ, name, depth, _) = parse_member_definition(&a)
+                            .ok_or("Could not parse argument to function definition")?;
+                        defined_args.push((
+                            name,
+                            Self::define_type_with_namespace(&typ, depth, bv, current_namespace)?,
+                        ));
+                    }
                 }
 
                 return Ok(Member::Function {
@@ -335,6 +351,29 @@ impl<'a> Member {
                 }
             }
         }
+    }
+    pub fn new_function_type(
+        ret: &Ref<Type>,
+        args: &Vec<(String, Ref<Type>)>,
+        bv: &BinaryView,
+    ) -> Result<Ref<Type>, String> {
+        let mut v = vec![];
+        for (arg_name, arg_type) in args {
+            v.push(FunctionParameter::new(
+                arg_type.clone(),
+                arg_name.clone(),
+                None,
+            ));
+        }
+        // Create function with return value, arguments, and `false`
+        // indicating no variable arguments
+        // TODO include variable arguments
+        let func = Type::function(ret.as_ref(), v, false);
+        let func = Type::pointer(
+            &bv.default_arch().ok_or("Could not find default arch")?,
+            func.as_ref(),
+        );
+        Ok(func)
     }
     pub fn define<'b>(
         &self,
@@ -397,22 +436,7 @@ impl<'a> Member {
             Member::Function { name, ret, args } => {
                 // Create a function type and pointer to that function
                 log::debug!("Adding function: {}", name);
-                let mut v = vec![];
-                for (arg_name, arg_type) in args {
-                    v.push(FunctionParameter::new(
-                        arg_type.clone(),
-                        arg_name.clone(),
-                        None,
-                    ));
-                }
-                // Create function with return value, arguments, and `false`
-                // indicating no variable arguments
-                // TODO include variable arguments
-                let func = Type::function(ret.as_ref(), v, false);
-                let func = Type::pointer(
-                    &bv.default_arch().ok_or("Could not find default arch")?,
-                    func.as_ref(),
-                );
+                let func = Self::new_function_type(ret, args, bv)?;
                 if let Some(o) = offset {
                     builder.insert(
                         func.as_ref(),
