@@ -118,7 +118,7 @@ mod tests {
 
         // Instantiate typedef
         assert!(base_template
-            .define(vec!["char".to_string(), "uint32_t".to_string()], &bv)
+            .define(vec!["char".to_string(), "uint32_t".to_string()], &bv, 0)
             .is_ok());
 
         // Create templated typedef
@@ -137,7 +137,7 @@ mod tests {
         let typedef_template = &templates[1];
 
         // This should create AA<char> which internally creates Abc<char, uint32_t>
-        if let Err(e) = typedef_template.define(vec!["char".to_string()], bv.as_ref()) {
+        if let Err(e) = typedef_template.define(vec!["char".to_string()], bv.as_ref(), 0) {
             println!("Could not define AA<char>: {e}");
             assert!(false);
         }
@@ -306,7 +306,7 @@ mod tests {
 
         // Define template instantiations needed for the test
         // structure_name<uint32_t> and structure_name<void*>
-        if let Err(e) = simple_template.define(vec!["uint32_t".to_string()], bv.as_ref()) {
+        if let Err(e) = simple_template.define(vec!["uint32_t".to_string()], bv.as_ref(), 0) {
             println!("Could not define simple_template<uint32_t>: {e}");
             assert!(false);
         }
@@ -314,7 +314,7 @@ mod tests {
             get_type_width_by_name(&"structure_name<uint32_t>", &bv),
             Some(4)
         );
-        if let Err(e) = simple_template.define(vec!["void*".to_string()], bv.as_ref()) {
+        if let Err(e) = simple_template.define(vec!["void*".to_string()], bv.as_ref(), 0) {
             println!("Could not define simple_template<void*>: {e}");
             assert!(false);
         }
@@ -336,6 +336,7 @@ mod tests {
         if let Err(e) = two_param_template.define(
             vec!["uint32_t".to_string(), "void*".to_string()],
             bv.as_ref(),
+            0,
         ) {
             println!("Could not define two_param_template<uint32_t, void*>: {e}");
             assert!(false);
@@ -356,6 +357,7 @@ mod tests {
         if let Err(e) = nested_template.define(
             vec!["void*".to_string(), "struct2_name".to_string()],
             bv.as_ref(),
+            0,
         ) {
             println!("Could not define nested_template<void*, struct2_name>: {e}");
             assert!(false);
@@ -373,9 +375,11 @@ mod tests {
             vec!["T".to_string(), "U".to_string()],
             Vec::new(),
         );
-        if let Err(e) =
-            templated_function.define(vec!["void".to_string(), "int32_t".to_string()], bv.as_ref())
-        {
+        if let Err(e) = templated_function.define(
+            vec!["void".to_string(), "int32_t".to_string()],
+            bv.as_ref(),
+            0,
+        ) {
             println!("Could not define templated_function<void, int32_t>: {e}");
             assert!(false);
         }
@@ -965,11 +969,11 @@ int32_t c[0x8];"#,
         assert_eq!(ns_template.get_full_name(), "Utils::Container");
 
         // Instantiate templates
-        if let Err(e) = global_template.define(vec!["int32_t".to_string()], bv.as_ref()) {
+        if let Err(e) = global_template.define(vec!["int32_t".to_string()], bv.as_ref(), 0) {
             println!("Could not define global template {e}");
             assert!(false);
         }
-        if let Err(e) = ns_template.define(vec!["int32_t".to_string()], bv.as_ref()) {
+        if let Err(e) = ns_template.define(vec!["int32_t".to_string()], bv.as_ref(), 0) {
             println!("Could not define ns template {e}");
             assert!(false);
         }

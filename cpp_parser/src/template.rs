@@ -108,7 +108,13 @@ impl<'a> Template {
     /// * `bv` - Binary Ninja binary view reference
     /// * `templates` - Reference to all templates for typedef resolution
     /// * `typedef_name` - Optional name for typedef templates (e.g., "AA" instead of "Abc")
-    pub fn define<'b>(&self, typenames: Vec<String>, bv: &'a BinaryView) -> Result<(), String> {
+    /// * `offset` - Pointer offset for the template definition. Default to 0 if unneeded.
+    pub fn define<'b>(
+        &self,
+        typenames: Vec<String>,
+        bv: &'a BinaryView,
+        offset: i64,
+    ) -> Result<(), String> {
         // Forward declare the type, which will be clobbered anyway.
         // Necessary for templated lists, arrays, trees, etc.
         let forward_decl = Type::structure(&StructureBuilder::new().finalize());
@@ -150,8 +156,13 @@ impl<'a> Template {
                         namespace_path,
                     )?);
                 }
-                Structure::new_from_members(instantiated_name, members, 0, namespace_path.clone())
-                    .define(bv)?;
+                Structure::new_from_members(
+                    instantiated_name,
+                    members,
+                    offset,
+                    namespace_path.clone(),
+                )
+                .define(bv)?;
                 Ok(())
             }
             Template::TypedefTemplate {

@@ -1,6 +1,7 @@
 use crate::{
     find_closing_token, find_next_token, parse_template_definition, parse_template_instantiation,
-    parse_typedef_assignment, strip_type_prefix, Class, Enum, Structure, Template, Typedef,
+    parse_typedef_assignment, strip_type_prefix, utils::parse_ptr_offset, Class, Enum, Structure,
+    Template, Typedef,
 };
 use binaryninja::{
     binary_view::{BinaryView, BinaryViewExt},
@@ -226,7 +227,16 @@ impl<'a> Parser<'a> {
                                     .ok_or(&format!(
                                         "Could not find template {s} for definition"
                                     ))?;
-                                t.define(typenames, self.bv)?;
+                                // Peek ahead to check for possible __ptr_offset
+                                let off = if let Some((_, _, peek)) =
+                                    find_next_token(&contents[idx + i2 + 1..])
+                                {
+                                    parse_ptr_offset(peek)?.unwrap_or(0)
+                                } else {
+                                    0
+                                };
+
+                                t.define(typenames, self.bv, off)?;
                             }
                             idx += i2 + 1;
                         }
