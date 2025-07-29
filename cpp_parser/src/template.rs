@@ -35,6 +35,8 @@ pub enum Template {
         concrete_parameters: Vec<(usize, String)>,
         /// Namespace path for this templated typedef
         namespace_path: Vec<String>,
+        /// Pointer depth of the templated type
+        depth: u64,
     },
 }
 
@@ -77,6 +79,7 @@ impl<'a> Template {
         target_template_name: String,
         templated_parameters: Vec<(usize, String)>,
         concrete_parameters: Vec<(usize, String)>,
+        depth: u64,
         namespace_path: Vec<String>,
     ) -> Self {
         Template::TypedefTemplate {
@@ -85,6 +88,7 @@ impl<'a> Template {
             target_template_name,
             templated_parameters,
             concrete_parameters,
+            depth,
             namespace_path,
         }
     }
@@ -156,6 +160,7 @@ impl<'a> Template {
                 target_template_name,
                 templated_parameters,
                 concrete_parameters,
+                depth,
                 ..
             } => {
                 if typenames.len() != template_params.len() {
@@ -203,10 +208,17 @@ impl<'a> Template {
                 let full_typename =
                     format!("{target_template_name}<{}>", target_typenames.join(", "));
                 let full_name = format!("{}<{}>", self.get_full_name(), typenames.join(", "));
-                let typ = get_non_primitive_type_by_name(&full_typename, bv).ok_or(format!(
+                let mut typ = get_non_primitive_type_by_name(&full_typename, bv).ok_or(format!(
                     "Could not find type {} for templated typedef definition",
                     full_typename
                 ))?;
+
+                for _ in 0..*depth {
+                    typ = Type::pointer(
+                        &bv.default_arch().expect("Could not find core arch"),
+                        typ.as_ref(),
+                    );
+                }
 
                 bv.define_user_type(&full_name, &typ);
 

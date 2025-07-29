@@ -238,11 +238,13 @@ pub fn parse_template_definition(s: &str) -> Option<Vec<String>> {
 /// from assignment statements used in templated typedef declarations.
 ///
 /// # Arguments
-/// * `s` - The assignment string, e.g., "AA = Abc<T, uint32_t>"
+/// * `s` - The assignment string, e.g., "AA = Abc<T, uint32_t>*"
 ///
 /// # Returns
-/// `Ok(Some((typedef_name, target_template_name, template_params)))` if parsing succeeds, `None` if it fails
-pub fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<String>)>, String> {
+/// `Ok(Some((typedef_name, target_template_name, template_params, depth)))` if parsing succeeds, `None` if it fails
+pub fn parse_typedef_assignment(
+    s: &str,
+) -> Result<Option<(String, String, Vec<String>, u64)>, String> {
     // Find the '=' separator
     let parts: Vec<&str> = s.splitn(2, '=').collect();
     if parts.len() != 2 {
@@ -250,7 +252,14 @@ pub fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<S
     }
 
     let typedef_name = parts[0].trim().to_string();
-    let target_type = parts[1].trim();
+    let mut target_type = parts[1].trim();
+    let mut depth = 0;
+    while target_type.ends_with("*") {
+        target_type = target_type
+            .strip_suffix("*")
+            .ok_or("Could not strip '*' from suffix in templated typedef")?;
+        depth += 1;
+    }
 
     // Parse the target type to extract template name and parameters
     if let Some(start) = target_type.find('<') {
@@ -264,7 +273,7 @@ pub fn parse_typedef_assignment(s: &str) -> Result<Option<(String, String, Vec<S
         let template_params = parse_template_instantiation(params_str)?
             .ok_or("Could not parse template instantiation in typedef assignment".to_string())?;
 
-        Ok(Some((typedef_name, template_name, template_params)))
+        Ok(Some((typedef_name, template_name, template_params, depth)))
     } else {
         // Non-templated target (shouldn't happen for templated typedefs, but handle gracefully)
         Err("Could not find starting < in typedef assignment".to_string())

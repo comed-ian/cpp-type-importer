@@ -141,7 +141,7 @@ impl<'a> Parser<'a> {
                                 // Strip "using " from the front and parse the assignment
                                 let assignment_string =
                                     full_using_statement.trim().strip_prefix("using ").unwrap();
-                                let (typedef_name, template_name, target_params) =
+                                let (typedef_name, template_name, target_params, depth) =
                                     parse_typedef_assignment(assignment_string)?
                                         .ok_or("Could not parse templated typedef assignment")?;
 
@@ -164,6 +164,7 @@ impl<'a> Parser<'a> {
                                     template_name,
                                     templated_parameters,
                                     concrete_parameters,
+                                    depth,
                                     self.get_current_namespace_path(),
                                 );
                                 self.templates.push(t);

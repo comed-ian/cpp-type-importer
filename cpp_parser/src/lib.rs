@@ -111,7 +111,7 @@ mod tests {
         let result = crate::parse_typedef_assignment(typedef_assignment);
         assert!(result.is_ok() && result.as_ref().unwrap().is_some());
 
-        let (typedef_name, template_name, params) = result.unwrap().unwrap();
+        let (typedef_name, template_name, params, depth) = result.unwrap().unwrap();
         assert_eq!(typedef_name, "AA");
         assert_eq!(template_name, "Abc");
         assert_eq!(params, vec!["N".to_string(), "uint32_t".to_string()]);
@@ -128,6 +128,7 @@ mod tests {
             "Abc".to_string(),
             vec![(0, "N".to_string())],        // N is at position 0
             vec![(1, "uint32_t".to_string())], // uint32_t is at position 1
+            depth,
             Vec::new(),
         );
 
@@ -147,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_parsing() {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut save_path = path.clone();
         save_path.push("test.bndb");
         let paths = vec!["../test.hpp"];
