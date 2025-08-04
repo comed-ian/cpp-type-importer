@@ -125,8 +125,13 @@ impl<'a> Member {
     ///
     /// # Returns
     /// Binary Ninja type reference for the defined type
-    pub fn define_type(t: &str, depth: u8, bv: &BinaryView) -> Result<Ref<Type>, String> {
-        Self::define_type_with_namespace(t, depth, bv, &Vec::new())
+    pub fn define_type(
+        t: &str,
+        depth: u8,
+        bv: &BinaryView,
+        current_namespace: &Vec<String>,
+    ) -> Result<Ref<Type>, String> {
+        Self::define_type_with_namespace(t, depth, bv, current_namespace)
     }
 
     pub fn define_type_with_namespace(
@@ -201,7 +206,7 @@ impl<'a> Member {
         );
         if let Some(_) = is_primitive(&typ) {
             // Is primitive
-            let typ = Self::define_type(&typ, depth, bv)?;
+            let typ = Self::define_type(&typ, depth, bv, current_namespace)?;
             match arrsize {
                 Some(l) => {
                     return Ok(Member::Array {
@@ -209,14 +214,14 @@ impl<'a> Member {
                         element_type: typ,
                         size: l,
                         comments: vec![],
-                    })
+                    });
                 }
                 None => {
                     return Ok(Member::Basic {
                         name,
                         typ,
                         comments: vec![],
-                    })
+                    });
                 }
             }
         } else {
@@ -309,14 +314,14 @@ impl<'a> Member {
                             element_type: typ,
                             size: l,
                             comments: vec![],
-                        })
+                        });
                     }
                     None => {
                         return Ok(Member::Basic {
                             name,
                             typ,
                             comments: vec![],
-                        })
+                        });
                     }
                 }
             }

@@ -44,7 +44,7 @@ impl<'a> Typedef {
         let mut target_type = if let Some(tt) = is_primitive(&self.typ) {
             tt
         } else {
-            Member::define_type(&self.typ, self.depth, bv)?
+            Member::define_type(&self.typ, self.depth, bv, &self.namespace_path)?
         };
 
         // If this is an array typedef, wrap the type in an array
