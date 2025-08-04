@@ -5,7 +5,8 @@ use binaryninja::types::{
 };
 use regex::Regex;
 
-use crate::{get_type_width_by_name, parse_name, parse_template_instantiation, Member};
+use crate::utils::resolve_type_name;
+use crate::{Member, get_type_width_by_name, parse_name, parse_template_instantiation};
 
 /// Represents a C++ class with virtual table, members, and inheritance
 ///
@@ -590,6 +591,11 @@ impl<'a> Class {
             if visited.contains(base_class) {
                 return current_offset;
             }
+
+            // In the event the base class belongs to a current namespace,
+            // explicitly iterate through the namespaces and ensure the correct
+            // type name is chosen.
+            let base_class = &resolve_type_name(base_class, bv, current_namespace);
 
             visited.insert(base_class.to_string());
             // Used to differentiate vtable overwrites. E.g, consider
