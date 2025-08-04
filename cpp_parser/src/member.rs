@@ -149,7 +149,7 @@ impl<'a> Member {
             tt
         } else {
             // Try to resolve the type with namespace resolution
-            let resolved_type = Self::resolve_type_name(t, bv, current_namespace);
+            let resolved_type = resolve_type_name(t, bv, current_namespace);
             if let Some(tt) = get_non_primitive_type_by_name(&resolved_type, bv) {
                 tt
             } else {
@@ -163,36 +163,6 @@ impl<'a> Member {
             );
         }
         Ok(typ)
-    }
-
-    /// Resolves a type name with namespace context
-    pub fn resolve_type_name(
-        type_name: &str,
-        bv: &BinaryView,
-        current_namespace: &Vec<String>,
-    ) -> String {
-        // If the type name already contains :: it's fully qualified
-        if type_name.contains("::") {
-            return type_name.to_string();
-        }
-
-        // Try to find the type in the current namespace hierarchy
-        // Start from the most specific namespace and work outward
-        for i in (0..=current_namespace.len()).rev() {
-            let namespace_path = &current_namespace[0..i];
-            let candidate_name = if namespace_path.is_empty() {
-                type_name.to_string()
-            } else {
-                format!("{}::{}", namespace_path.join("::"), type_name)
-            };
-
-            if bv.type_id_by_name(&candidate_name).is_some() {
-                return candidate_name;
-            }
-        }
-
-        // If not found in any namespace, return the original name
-        type_name.to_string()
     }
 
     /// Creates a new member from its definition string

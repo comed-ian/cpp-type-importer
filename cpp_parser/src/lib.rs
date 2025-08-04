@@ -32,8 +32,8 @@ mod tests {
 
     use crate::{
         get_non_primitive_type_by_name, get_type_by_name, get_type_width_by_name, is_primitive,
-        parse_name, parse_template_definition, parse_template_instantiation, parser::Parser, Class,
-        Enum, Member, Structure, Template, Typedef,
+        parse_name, parse_template_definition, parse_template_instantiation, parser::Parser,
+        utils::resolve_type_name, Class, Enum, Member, Structure, Template, Typedef,
     };
     use binaryninja::binary_view::BinaryViewExt;
 
@@ -283,7 +283,10 @@ mod tests {
         let mut basic_struct =
             Structure::new("struct2_name", "int32_t x;", bv.as_ref(), Vec::new()).unwrap();
         assert!(basic_struct.define(bv.as_ref()).is_ok());
-        assert_eq!(get_type_width_by_name(&"struct2_name", &bv), Some(4));
+        assert_eq!(
+            get_type_width_by_name(&"struct2_name", &bv, &vec![]),
+            Some(4)
+        );
 
         // Define class_name as a basic struct
         let mut class_struct = Structure::new(
@@ -294,7 +297,7 @@ mod tests {
         )
         .unwrap();
         assert!(class_struct.define(bv.as_ref()).is_ok());
-        assert_eq!(get_type_width_by_name(&"class_name", &bv), Some(8));
+        assert_eq!(get_type_width_by_name(&"class_name", &bv, &vec![]), Some(8));
 
         // Define a simple template structure
         let simple_template = Template::new(
@@ -311,7 +314,7 @@ mod tests {
             assert!(false);
         }
         assert_eq!(
-            get_type_width_by_name(&"structure_name<uint32_t>", &bv),
+            get_type_width_by_name(&"structure_name<uint32_t>", &bv, &vec![]),
             Some(4)
         );
         if let Err(e) = simple_template.define(vec!["void*".to_string()], bv.as_ref(), 0) {
@@ -319,7 +322,7 @@ mod tests {
             assert!(false);
         }
         assert_eq!(
-            get_type_width_by_name(&"structure_name<void*>", &bv),
+            get_type_width_by_name(&"structure_name<void*>", &bv, &vec![]),
             Some(8)
         );
 
@@ -342,7 +345,7 @@ mod tests {
             assert!(false);
         }
         assert_eq!(
-            get_type_width_by_name(&"structure_name_two<uint32_t, void*>", &bv),
+            get_type_width_by_name(&"structure_name_two<uint32_t, void*>", &bv, &vec![]),
             Some(0x10)
         );
 
@@ -364,7 +367,7 @@ mod tests {
         }
         // TODO check packed
         assert_eq!(
-            get_type_width_by_name(&"nested_struct<void*, struct2_name>", &bv),
+            get_type_width_by_name(&"nested_struct<void*, struct2_name>", &bv, &vec![]),
             Some(0x10)
         );
 
@@ -384,7 +387,7 @@ mod tests {
             assert!(false);
         }
         assert_eq!(
-            get_type_width_by_name(&"function_struct<void, int32_t>", &bv),
+            get_type_width_by_name(&"function_struct<void, int32_t>", &bv, &vec![]),
             Some(8)
         );
 
@@ -553,10 +556,10 @@ mod tests {
         );
 
         // Get the sizes of both structures
-        let regular_size = get_type_width_by_name("RegularStruct", &bv)
+        let regular_size = get_type_width_by_name("RegularStruct", &bv, &vec![])
             .expect("Could not get regular struct size");
-        let packed_size =
-            get_type_width_by_name("PackedStruct", &bv).expect("Could not get packed struct size");
+        let packed_size = get_type_width_by_name("PackedStruct", &bv, &vec![])
+            .expect("Could not get packed struct size");
 
         // The packed structure should be smaller than the regular structure
         // Regular: char(1) + 3 padding + int32_t(4) + char(1) + 3 padding = 12 bytes
@@ -675,7 +678,10 @@ uint32_t c[0x8];"#,
         .unwrap();
         assert!(base_struct.define(bv.as_ref()).is_ok());
 
-        assert_eq!(get_type_width_by_name("ArrayStruct", &bv), Some(0x38));
+        assert_eq!(
+            get_type_width_by_name("ArrayStruct", &bv, &vec![]),
+            Some(0x38)
+        );
         let base_type = get_type_by_name("ArrayStruct", &bv).unwrap();
         let arr_type_b = Type::array(is_primitive("char").unwrap().as_ref(), 0x10);
         let arr_type_c = Type::array(is_primitive("uint32_t").unwrap().as_ref(), 0x8);
@@ -717,7 +723,7 @@ int32_t c[0x8];"#,
         assert!(nested_struct.define(bv.as_ref()).is_ok());
 
         assert_eq!(
-            get_type_width_by_name("ArrayStruct2", &bv),
+            get_type_width_by_name("ArrayStruct2", &bv, &vec![]),
             Some(0xa8 + 0x20 + 0x20)
         );
         let base_type_2 = get_type_by_name("ArrayStruct2", &bv).unwrap();
@@ -831,9 +837,12 @@ int32_t c[0x8];"#,
         assert!(bv.type_id_by_name("QQQ::RRR::aaa").is_some());
 
         // Verify they have different sizes to confirm they're different types
-        assert_eq!(get_type_width_by_name("aaa", &bv), Some(8)); // int32_t + int32_t
-        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv), Some(0x10)); // uint32_t + void* (with padding)
-        assert_eq!(get_type_width_by_name("QQQ::RRR::aaa", &bv), Some(0x18)); // void* + uint32_t + uint64_t (with padding)
+        assert_eq!(get_type_width_by_name("aaa", &bv, &vec![]), Some(8)); // int32_t + int32_t
+        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv, &vec![]), Some(0x10)); // uint32_t + void* (with padding)
+        assert_eq!(
+            get_type_width_by_name("QQQ::RRR::aaa", &bv, &vec![]),
+            Some(0x18)
+        ); // void* + uint32_t + uint64_t (with padding)
     }
 
     #[test]
@@ -863,19 +872,19 @@ int32_t c[0x8];"#,
 
         // From global context, should find global type
         assert_eq!(
-            Member::resolve_type_name("TestType", bv.as_ref(), &global_context),
+            resolve_type_name("TestType", bv.as_ref(), &global_context),
             "TestType"
         );
 
         // From NS context, should find namespaced type first
         assert_eq!(
-            Member::resolve_type_name("TestType", bv.as_ref(), &ns_context),
+            resolve_type_name("TestType", bv.as_ref(), &ns_context),
             "NS::TestType"
         );
 
         // Fully qualified names should resolve as-is
         assert_eq!(
-            Member::resolve_type_name("NS::TestType", bv.as_ref(), &global_context),
+            resolve_type_name("NS::TestType", bv.as_ref(), &global_context),
             "NS::TestType"
         );
     }
@@ -983,9 +992,12 @@ int32_t c[0x8];"#,
         assert!(bv.type_id_by_name("Utils::Container<int32_t>").is_some());
 
         // They should have different sizes
-        assert_eq!(get_type_width_by_name("Container<int32_t>", &bv), Some(4)); // Just T value
         assert_eq!(
-            get_type_width_by_name("Utils::Container<int32_t>", &bv),
+            get_type_width_by_name("Container<int32_t>", &bv, &vec![]),
+            Some(4)
+        ); // Just T value
+        assert_eq!(
+            get_type_width_by_name("Utils::Container<int32_t>", &bv, &vec![]),
             Some(8)
         ); // T data + int32_t size
     }
@@ -1069,10 +1081,19 @@ int32_t c[0x8];"#,
         assert!(bv.type_id_by_name("QQQ::RRR::bbb").is_some());
 
         // Verify they have the expected sizes
-        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv), Some(0x10)); // uint32_t + void*
-        assert_eq!(get_type_width_by_name("QQQ::RRR::aaa", &bv), Some(0x18)); // void* + bool + padding + uint64_t
-        assert_eq!(get_type_width_by_name("QQQ::RRR::bbb", &bv), Some(0x18)); // QQQ::RRR::aaa
-        assert_eq!(get_type_width_by_name("QQQ::RRR::ccc", &bv), Some(0x10)); // QQQ::aaa
+        assert_eq!(get_type_width_by_name("QQQ::aaa", &bv, &vec![]), Some(0x10)); // uint32_t + void*
+        assert_eq!(
+            get_type_width_by_name("QQQ::RRR::aaa", &bv, &vec![]),
+            Some(0x18)
+        ); // void* + bool + padding + uint64_t
+        assert_eq!(
+            get_type_width_by_name("QQQ::RRR::bbb", &bv, &vec![]),
+            Some(0x18)
+        ); // QQQ::RRR::aaa
+        assert_eq!(
+            get_type_width_by_name("QQQ::RRR::ccc", &bv, &vec![]),
+            Some(0x10)
+        ); // QQQ::aaa
     }
 
     #[test]
@@ -1135,15 +1156,15 @@ uint32_t derived_member;"#,
 
         // Check that vtable definition worked correctly
         assert_eq!(
-            get_type_width_by_name("BaseClass_vtable", &bv).unwrap(),
+            get_type_width_by_name("BaseClass_vtable", &bv, &vec![]).unwrap(),
             0x20
         );
         assert_eq!(
-            get_type_width_by_name("MiddleClass_vtable_BaseClass", &bv).unwrap(),
+            get_type_width_by_name("MiddleClass_vtable_BaseClass", &bv, &vec![]).unwrap(),
             0x28
         );
         assert_eq!(
-            get_type_width_by_name("DerivedClass_vtable_MiddleClass", &bv).unwrap(),
+            get_type_width_by_name("DerivedClass_vtable_MiddleClass", &bv, &vec![]).unwrap(),
             0x30
         );
 
@@ -1410,10 +1431,12 @@ uint64_t middle_ptr; // ; override void* MemberMiddle::middle_ptr;"#,
         assert!(derived_class.define(bv.as_ref()).is_ok());
 
         // Verify class sizes include inherited members
-        let base_size = get_type_width_by_name("MemberBase", &bv).expect("Base class size");
-        let middle_size = get_type_width_by_name("MemberMiddle", &bv).expect("Middle class size");
+        let base_size =
+            get_type_width_by_name("MemberBase", &bv, &vec![]).expect("Base class size");
+        let middle_size =
+            get_type_width_by_name("MemberMiddle", &bv, &vec![]).expect("Middle class size");
         let derived_size =
-            get_type_width_by_name("MemberDerived", &bv).expect("Derived class size");
+            get_type_width_by_name("MemberDerived", &bv, &vec![]).expect("Derived class size");
 
         // Base class: vtable ptr (8) + char (1) + padding (3) + int32_t (4) = 16 bytes
         assert_eq!(base_size, 0x10);
@@ -1759,13 +1782,22 @@ bool derived_member;"#,
         assert_eq!(derived.vtable_methods.len(), 0); // overrides + new methodDerived
 
         // Check sizes account for multiple inheritance
-        assert_eq!(get_type_width_by_name("Base1", &bv).unwrap(), 0x10); // vtable (8) + int32_t * 2 (8)
-        assert_eq!(get_type_width_by_name("Base2", &bv).unwrap(), 0x10); // vtable (8) + int64_t (8)
-        assert_eq!(get_type_width_by_name("Base3", &bv).unwrap(), 0x10); // vtable (8) + uint32_t * 2 (8)
-        assert_eq!(get_type_width_by_name("Base4", &bv).unwrap(), 0x10); // vtable (8) + uint64_t (8)
-        assert_eq!(get_type_width_by_name("MultiMiddle1", &bv).unwrap(), 0x28); // base1 (0x10) + base2 (0x10) + uint64_t (8)
-        assert_eq!(get_type_width_by_name("MultiMiddle2", &bv).unwrap(), 0x28); // base3 (0x10) + base4 (0x10) + uint64_t (8)
-        assert_eq!(get_type_width_by_name("MultiDerived", &bv).unwrap(), 0x51); // MultiMiddle1 (0x28) + MultiMiddle2 (0x28) + bool (1) + padding (3)
+        assert_eq!(get_type_width_by_name("Base1", &bv, &vec![]).unwrap(), 0x10); // vtable (8) + int32_t * 2 (8)
+        assert_eq!(get_type_width_by_name("Base2", &bv, &vec![]).unwrap(), 0x10); // vtable (8) + int64_t (8)
+        assert_eq!(get_type_width_by_name("Base3", &bv, &vec![]).unwrap(), 0x10); // vtable (8) + uint32_t * 2 (8)
+        assert_eq!(get_type_width_by_name("Base4", &bv, &vec![]).unwrap(), 0x10); // vtable (8) + uint64_t (8)
+        assert_eq!(
+            get_type_width_by_name("MultiMiddle1", &bv, &vec![]).unwrap(),
+            0x28
+        ); // base1 (0x10) + base2 (0x10) + uint64_t (8)
+        assert_eq!(
+            get_type_width_by_name("MultiMiddle2", &bv, &vec![]).unwrap(),
+            0x28
+        ); // base3 (0x10) + base4 (0x10) + uint64_t (8)
+        assert_eq!(
+            get_type_width_by_name("MultiDerived", &bv, &vec![]).unwrap(),
+            0x51
+        ); // MultiMiddle1 (0x28) + MultiMiddle2 (0x28) + bool (1) + padding (3)
 
         // Verify class composition
         let derived_type = get_type_by_name("MultiDerived", &bv).unwrap();

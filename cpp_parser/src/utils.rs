@@ -33,7 +33,38 @@ pub fn is_primitive(s: &str) -> Option<Ref<Type>> {
     }
 }
 
-pub fn get_type_width_by_name(name: &str, bv: &BinaryView) -> Option<u64> {
+/// Resolves a type name with namespace context
+pub fn resolve_type_name(type_name: &str, bv: &BinaryView, current_namespace: &[String]) -> String {
+    // If the type name already contains :: it's fully qualified
+    if type_name.contains("::") {
+        return type_name.to_string();
+    }
+
+    // Try to find the type in the current namespace hierarchy
+    // Start from the most specific namespace and work outward
+    for i in (0..=current_namespace.len()).rev() {
+        let namespace_path = &current_namespace[0..i];
+        let candidate_name = if namespace_path.is_empty() {
+            type_name.to_string()
+        } else {
+            format!("{}::{}", namespace_path.join("::"), type_name)
+        };
+
+        if bv.type_id_by_name(&candidate_name).is_some() {
+            return candidate_name;
+        }
+    }
+
+    // If not found in any namespace, return the original name
+    type_name.to_string()
+}
+
+pub fn get_type_width_by_name(
+    name: &str,
+    bv: &BinaryView,
+    current_namespace: &[String],
+) -> Option<u64> {
+    let name = resolve_type_name(name, bv, current_namespace);
     let id = bv.type_id_by_name(name)?;
     // Get the width of the base vtable. This works with `NamedTypedReference`
     // because the underlying type is a pointer. BEWARE, this does not work

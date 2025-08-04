@@ -569,7 +569,11 @@ impl<'a> Class {
     ///
     /// # Returns
     /// A vector of tuples (base_class_name, offset) for all base classes
-    fn collect_all_base_classes(&self, bv: &'a BinaryView) -> Vec<(String, u64)> {
+    fn collect_all_base_classes(
+        &self,
+        bv: &'a BinaryView,
+        current_namespace: &[String],
+    ) -> Vec<(String, u64)> {
         let mut all_bases = Vec::new();
         let mut visited = std::collections::HashSet::new();
 
@@ -581,6 +585,7 @@ impl<'a> Class {
             all_bases: &mut Vec<(String, u64)>,
             visited: &mut std::collections::HashSet<String>,
             bv: &BinaryView,
+            current_namespace: &[String],
         ) -> u64 {
             if visited.contains(base_class) {
                 return current_offset;
@@ -622,12 +627,15 @@ impl<'a> Class {
                                 all_bases,
                                 visited,
                                 bv,
+                                current_namespace,
                             );
                         }
                         // Increment offset by the width of this base class if this
                         // child has no children.
                         if base_structure.base_structures().is_empty() {
-                            if let Some(width) = get_type_width_by_name(&base_class, bv) {
+                            if let Some(width) =
+                                get_type_width_by_name(&base_class, bv, current_namespace)
+                            {
                                 return current_offset + width;
                             }
                         }
@@ -647,10 +655,11 @@ impl<'a> Class {
                 &mut all_bases,
                 &mut visited,
                 bv,
+                current_namespace,
             );
 
             // Increment offset by the width of this direct base class
-            if let Some(width) = get_type_width_by_name(base_class, bv) {
+            if let Some(width) = get_type_width_by_name(base_class, bv, &self.namespace_path) {
                 current_offset += width;
             }
         }
@@ -691,7 +700,7 @@ impl<'a> Class {
             // Has inheritance - collect all non-top-level base classes. Top-level
             // parent classes are handled next.
             let all_base_classes: Vec<(String, u64)> = self
-                .collect_all_base_classes(bv)
+                .collect_all_base_classes(bv, &self.namespace_path)
                 .into_iter()
                 .filter(|(name, _)| !self.base_classes.contains(name))
                 .collect::<_>();
@@ -702,7 +711,7 @@ impl<'a> Class {
             let mut vtable_names_and_offsets = vec![];
             let mut current_offset = 0u64;
             for top_level_base in self.base_classes.iter() {
-                let width = get_type_width_by_name(top_level_base, bv)
+                let width = get_type_width_by_name(top_level_base, bv, &self.namespace_path)
                     .expect(&format!("Could not find width for {}", top_level_base));
 
                 // Check if there are any inherited classes at top-level parent class's offset.
@@ -758,7 +767,9 @@ impl<'a> Class {
                     );
 
                     // Get the width of the base vtable.
-                    if let Some(width) = get_type_width_by_name(&inherited_vtable_name, bv) {
+                    if let Some(width) =
+                        get_type_width_by_name(&inherited_vtable_name, bv, &self.namespace_path)
+                    {
                         base_vtable_width = width;
                     }
 
@@ -814,7 +825,8 @@ impl<'a> Class {
                 );
 
                 // Get the width of this base class
-                let base_width = get_type_width_by_name(&base_class, bv).unwrap_or(0);
+                let base_width =
+                    get_type_width_by_name(&base_class, bv, &self.namespace_path).unwrap_or(0);
 
                 let base_struct = BaseStructure::new(base_ref, cumulative_width, base_width);
                 base_structures.push(base_struct);
@@ -859,7 +871,7 @@ impl<'a> Class {
         }
 
         // Step 3: Handle member variable overrides and add member variables specific to this class
-        let all_base_classes = self.collect_all_base_classes(bv);
+        let all_base_classes = self.collect_all_base_classes(bv, &self.namespace_path);
         for (member, override_info) in &self.member_variables {
             if let Some(override_str) = override_info {
                 // This member overrides a base class member
