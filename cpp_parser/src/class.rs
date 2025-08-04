@@ -6,7 +6,7 @@ use binaryninja::types::{
 use regex::Regex;
 
 use crate::utils::resolve_type_name;
-use crate::{Member, get_type_width_by_name, parse_name, parse_template_instantiation};
+use crate::{get_type_width_by_name, parse_name, parse_template_instantiation, Member};
 
 /// Represents a C++ class with virtual table, members, and inheritance
 ///
@@ -46,7 +46,7 @@ impl<'a> Class {
         // Parse class name and inheritance with regex
         // TODO parse inherited classes differently, inherited classes could be templated
         let class_regex = Regex::new(r"class\s+(\w+)(?:\s*:\s*(.+))?").unwrap();
-        let (name, base_classes) = if let Some(captures) = class_regex.captures(def) {
+        let (name, mut base_classes) = if let Some(captures) = class_regex.captures(def) {
             if let Some(class_name) = captures.get(1) {
                 let class_name = class_name.as_str().to_string();
                 let base_classes = if let Some(inheritance) = captures.get(2) {
@@ -76,6 +76,11 @@ impl<'a> Class {
                 ("".to_string(), Vec::new())
             }
         };
+
+        // Ensure all base class names are resolved prior to continuing
+        for base in base_classes.iter_mut() {
+            *base = resolve_type_name(&base, bv, &namespace_path);
+        }
 
         // Forward-declare the class as a structure so it can be referenced in constructor signatures
         let forward_decl = Type::structure(&StructureBuilder::new().finalize());
@@ -591,11 +596,6 @@ impl<'a> Class {
             if visited.contains(base_class) {
                 return current_offset;
             }
-
-            // In the event the base class belongs to a current namespace,
-            // explicitly iterate through the namespaces and ensure the correct
-            // type name is chosen.
-            let base_class = &resolve_type_name(base_class, bv, current_namespace);
 
             visited.insert(base_class.to_string());
             // Used to differentiate vtable overwrites. E.g, consider
