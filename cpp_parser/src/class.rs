@@ -473,9 +473,10 @@ impl<'a> Class {
     /// `None` if parsing fails
     fn extract_method_name_from_override(override_str: &str) -> Option<String> {
         // Parse override string like `void (* base_vtable::fn)(struct base* this);`
-        // Remove the inherited `base_vtable::` prefix while keeping the rest
-        let regex = Regex::new(r"\S+_vtable(\w+)?::").unwrap();
-        let cleaned = regex.replace_all(override_str, "");
+        // or namesp::derived::vtable_namesp::base::fn)(struct derived* this);
+        // Remove the `derived_vtable::` and `base::` prefixes while keeping the function name
+        let regex = Regex::new(r"^(.*\(\* )(.*::)(~?\w+\).*)").unwrap();
+        let cleaned = regex.replace_all(override_str, "$1$3");
         Some(cleaned.to_string())
     }
 
