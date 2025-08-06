@@ -31,9 +31,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        get_non_primitive_type_by_name, get_type_by_name, get_type_width_by_name, is_primitive,
-        parse_name, parse_template_definition, parse_template_instantiation, parser::Parser,
-        utils::resolve_type_name, Class, Enum, Member, Structure, Template, Typedef,
+        Class, Enum, Member, Structure, Template, Typedef, get_non_primitive_type_by_name,
+        get_type_by_name, get_type_width_by_name, is_primitive, parse_name,
+        parse_template_definition, parse_template_instantiation, parser::Parser,
+        utils::resolve_type_name,
     };
     use binaryninja::binary_view::BinaryViewExt;
 
@@ -92,6 +93,34 @@ mod tests {
     }
 
     #[test]
+    fn test_types() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test.bndb");
+        let headless_session = Session::new().expect("Failed to initialize session");
+        let bv = headless_session.load(&path).expect("Couldn't open bv");
+
+        // Assert no types
+        assert!(get_type_by_name("ns::MyStruct", &bv).is_none());
+        assert!(get_non_primitive_type_by_name("ns::MyStruct", &bv).is_none());
+
+        // Define structure with namespace
+        let mut basic_struct =
+            Structure::new("MyStruct", "int32_t x;", bv.as_ref(), vec!["ns".into()]).unwrap();
+        assert!(basic_struct.define(bv.as_ref()).is_ok());
+        assert!(get_type_by_name("ns::MyStruct", &bv).is_some());
+        assert!(get_non_primitive_type_by_name("ns::MyStruct", &bv).is_some());
+        // Find width with and without namespace
+        assert_eq!(
+            get_type_width_by_name(&"ns::MyStruct", &bv, &vec![]),
+            Some(4)
+        );
+        assert_eq!(
+            get_type_width_by_name(&"MyStruct", &bv, &vec!["ns".into()]),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn test_templated_typedef() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("test.bndb");
@@ -117,9 +146,16 @@ mod tests {
         assert_eq!(params, vec!["N".to_string(), "uint32_t".to_string()]);
 
         // Instantiate typedef
-        assert!(base_template
-            .define(vec!["char".to_string(), "uint32_t".to_string()], &bv, 0)
-            .is_ok());
+        assert!(
+            base_template
+                .define(
+                    vec!["char".to_string(), "uint32_t".to_string()],
+                    &bv,
+                    0,
+                    &vec![]
+                )
+                .is_ok()
+        );
 
         // Create templated typedef
         let templated_typedef = Template::new_typedef(
@@ -137,7 +173,7 @@ mod tests {
         let typedef_template = &templates[1];
 
         // This should create AA<char> which internally creates Abc<char, uint32_t>
-        if let Err(e) = typedef_template.define(vec!["char".to_string()], bv.as_ref(), 0) {
+        if let Err(e) = typedef_template.define(vec!["char".to_string()], bv.as_ref(), 0, &vec![]) {
             println!("Could not define AA<char>: {e}");
             assert!(false);
         }
@@ -309,7 +345,9 @@ mod tests {
 
         // Define template instantiations needed for the test
         // structure_name<uint32_t> and structure_name<void*>
-        if let Err(e) = simple_template.define(vec!["uint32_t".to_string()], bv.as_ref(), 0) {
+        if let Err(e) =
+            simple_template.define(vec!["uint32_t".to_string()], bv.as_ref(), 0, &vec![])
+        {
             println!("Could not define simple_template<uint32_t>: {e}");
             assert!(false);
         }
@@ -317,7 +355,7 @@ mod tests {
             get_type_width_by_name(&"structure_name<uint32_t>", &bv, &vec![]),
             Some(4)
         );
-        if let Err(e) = simple_template.define(vec!["void*".to_string()], bv.as_ref(), 0) {
+        if let Err(e) = simple_template.define(vec!["void*".to_string()], bv.as_ref(), 0, &vec![]) {
             println!("Could not define simple_template<void*>: {e}");
             assert!(false);
         }
@@ -340,6 +378,7 @@ mod tests {
             vec!["uint32_t".to_string(), "void*".to_string()],
             bv.as_ref(),
             0,
+            &vec![],
         ) {
             println!("Could not define two_param_template<uint32_t, void*>: {e}");
             assert!(false);
@@ -361,6 +400,7 @@ mod tests {
             vec!["void*".to_string(), "struct2_name".to_string()],
             bv.as_ref(),
             0,
+            &vec![],
         ) {
             println!("Could not define nested_template<void*, struct2_name>: {e}");
             assert!(false);
@@ -382,6 +422,7 @@ mod tests {
             vec!["void".to_string(), "int32_t".to_string()],
             bv.as_ref(),
             0,
+            &vec![],
         ) {
             println!("Could not define templated_function<void, int32_t>: {e}");
             assert!(false);
@@ -962,10 +1003,6 @@ int32_t c[0x8];"#,
         let headless_session = Session::new().expect("Failed to initialize session");
         let bv = headless_session.load(&path).expect("Couldn't open bv");
 
-        // Define templates in different namespaces
-        let global_template =
-            Template::new("Container", "T value;", vec!["T".to_string()], Vec::new());
-
         let ns_template = Template::new(
             "Container",
             "T data;\nint32_t size;",
@@ -973,33 +1010,41 @@ int32_t c[0x8];"#,
             vec!["Utils".to_string()],
         );
 
-        // Test get_full_name functionality for templates
-        assert_eq!(global_template.get_full_name(), "Container");
+        // Test get_full_name functionality for template
         assert_eq!(ns_template.get_full_name(), "Utils::Container");
 
-        // Instantiate templates
-        if let Err(e) = global_template.define(vec!["int32_t".to_string()], bv.as_ref(), 0) {
-            println!("Could not define global template {e}");
-            assert!(false);
-        }
-        if let Err(e) = ns_template.define(vec!["int32_t".to_string()], bv.as_ref(), 0) {
-            println!("Could not define ns template {e}");
-            assert!(false);
+        // Define a type in a different namespace
+        let mut ns_struct = Structure::new(
+            "struct MyType",
+            "int64_t value;",
+            bv.as_ref(),
+            vec!["TestNS".to_string()],
+        )
+        .unwrap();
+        assert!(ns_struct.define(bv.as_ref()).is_ok());
+
+        // Instantiate template from different namespace with local typename
+        if let Err(e) = ns_template.define(
+            vec!["MyType".to_string()],
+            bv.as_ref(),
+            0,
+            &vec!["TestNS".into()],
+        ) {
+            panic!("Could not define ns template {e}");
         }
 
         // Verify instantiated types have correct names
-        assert!(bv.type_id_by_name("Container<int32_t>").is_some());
-        assert!(bv.type_id_by_name("Utils::Container<int32_t>").is_some());
+        assert!(bv.type_id_by_name("TestNS::MyType").is_some());
+        assert!(
+            bv.type_id_by_name("Utils::Container<TestNS::MyType>")
+                .is_some()
+        );
 
         // They should have different sizes
         assert_eq!(
-            get_type_width_by_name("Container<int32_t>", &bv, &vec![]),
-            Some(4)
-        ); // Just T value
-        assert_eq!(
-            get_type_width_by_name("Utils::Container<int32_t>", &bv, &vec![]),
-            Some(8)
-        ); // T data + int32_t size
+            get_type_width_by_name("Utils::Container<TestNS::MyType>", &bv, &vec![]),
+            Some(0x10)
+        ); // T data + int32_t size + 4 bytes of padding
     }
 
     #[test]

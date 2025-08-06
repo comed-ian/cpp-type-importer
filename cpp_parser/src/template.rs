@@ -1,7 +1,8 @@
 use binaryninja::binary_view::{BinaryView, BinaryViewExt};
 use binaryninja::types::{StructureBuilder, Type};
 
-use crate::{get_non_primitive_type_by_name, parse_name, Member, Structure};
+use crate::utils::resolve_type_name;
+use crate::{Member, Structure, get_non_primitive_type_by_name, parse_name};
 
 /// Represents different types of C++ templates
 #[derive(Debug, Clone)]
@@ -114,14 +115,8 @@ impl<'a> Template {
         typenames: Vec<String>,
         bv: &'a BinaryView,
         offset: i64,
+        defined_namespace_path: &Vec<String>,
     ) -> Result<(), String> {
-        // Forward declare the type, which will be clobbered anyway.
-        // Necessary for templated lists, arrays, trees, etc.
-        let forward_decl = Type::structure(&StructureBuilder::new().finalize());
-        let full_name = self.get_full_name();
-        let full_name = format!("{full_name}<{}>", typenames.join(", "));
-        log::info!("Forward declaring templated structure: {full_name}");
-        bv.define_user_type(&full_name, &forward_decl);
         match self {
             Template::StructTemplate {
                 name,
@@ -129,7 +124,24 @@ impl<'a> Template {
                 body,
                 namespace_path,
             } => {
-                let instantiated_name = format!("{name}<{}>", typenames.join(", "));
+                // Typenames might be local to the defined namespace. Resolve the
+                // full name (by checking until a valid type exists) and join the
+                // instantiated name accordingly
+                let mut instantiated_typenames = Vec::<String>::new();
+                for t in typenames.iter() {
+                    instantiated_typenames.push(resolve_type_name(&t, bv, defined_namespace_path));
+                }
+                // Instantiate type with full namespace resolution
+                let instantiated_name = format!(
+                    "{}<{}>",
+                    self.get_full_name(),
+                    instantiated_typenames.join(", ")
+                );
+                // Forward declare the type, which will be clobbered anyway.
+                // Necessary for templated lists, arrays, trees, etc.
+                let forward_decl = Type::structure(&StructureBuilder::new().finalize());
+                log::info!("Forward declaring templated structure: {instantiated_name}");
+                bv.define_user_type(&instantiated_name, &forward_decl);
                 if typenames.len() != template_params.len() {
                     return Err(
                         "Provided typenames length does not match expected typenames length"
@@ -144,7 +156,7 @@ impl<'a> Template {
                     log::debug!(
                         "Defining member {} for templated type {}",
                         member,
-                        instantiated_name
+                        self.get_full_name()
                     );
                     // Create a new member and provide the typenames to swap in case
                     // the given member uses a typename
@@ -153,11 +165,13 @@ impl<'a> Template {
                         bv,
                         Some(template_params),
                         Some(&typenames),
-                        namespace_path,
+                        defined_namespace_path,
                     )?);
                 }
+                // Use self.name here, because new_from_members prepends the namespaces by default.
+                let structure_name = format!("{}<{}>", name, instantiated_typenames.join(", "));
                 Structure::new_from_members(
-                    instantiated_name,
+                    structure_name,
                     members,
                     offset,
                     namespace_path.clone(),

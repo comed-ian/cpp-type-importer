@@ -236,7 +236,12 @@ impl<'a> Parser<'a> {
                                     0
                                 };
 
-                                t.define(typenames, self.bv, off)?;
+                                t.define(
+                                    typenames,
+                                    self.bv,
+                                    off,
+                                    &self.get_current_namespace_path(),
+                                )?;
                             }
                             idx += i2 + 1;
                         }

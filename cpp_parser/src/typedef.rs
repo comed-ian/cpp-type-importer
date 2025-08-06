@@ -41,6 +41,9 @@ impl<'a> Typedef {
     }
 
     pub fn define(&self, bv: &'a BinaryView) -> Result<(), String> {
+        // TODO parse self.typ for templated names and resolve within current namespace.
+        // For example, if current namespace is A and A::MyStruct exists, then resolve
+        // B::template_name<MyStruct> --> B::template_name<A::MyStruct>
         let mut target_type = if let Some(tt) = is_primitive(&self.typ) {
             tt
         } else {
